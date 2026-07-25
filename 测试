@@ -1,0 +1,19 @@
+# 1. 初始化仓库（只执行一次）
+git init
+
+# 2. 配置账号（替换成你自己的信息）
+git config --global user.name "952371672"
+git config --global user.email "你github注册的邮箱"
+
+# 3. 添加文件
+git add .
+
+# 4. 提交注释
+git commit -m "第一次初始化提交，新增测试文档"
+
+# 5. 关联你的远程仓库
+git remote add origin https://github.com/952371672/linux.git
+
+# 6. 推送上去
+git branch -M main
+git push -u origin main

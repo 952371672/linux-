@@ -5,10 +5,10 @@ set -Eeuo pipefail
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | bash -s -- OWNER/REPO
 # Optional:
-#   INSTALL_DIR=/opt/cmcc-linux-docker CMCC_ASSET=CMCC云电脑保活Docker版.zip bash -s -- OWNER/REPO
+#   INSTALL_DIR=/opt/cmcc-linux-docker CMCC_ASSET=CMCC.Docker.zip bash -s -- OWNER/REPO
 
 REPO="${1:-${CMCC_GITHUB_REPO:-}}"
-ASSET="${CMCC_ASSET:-CMCC云电脑保活Docker版.zip}"
+ASSET="${CMCC_ASSET:-CMCC.Docker.zip}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/cmcc-linux-docker}"
 RELEASE_TAG="${CMCC_RELEASE_TAG:-latest}"
 

@@ -47,14 +47,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
-JSON="$TMP_DIR/release.json"
-echo "读取 GitHub Release：${REPO} (${RELEASE_TAG})"
-curl -fsSL --retry 3 --retry-delay 2 \
-  -H 'Accept: application/vnd.github+json' \
-  -H 'User-Agent: cmcc-cloud-alive-installer' \
-  "$API_URL" -o "$JSON"
+# 优先使用本机已有的安装包，避免重复下载。
+# 可显式指定：CMCC_LOCAL_ARCHIVE=/path/CMCC.Docker.zip
+ARCHIVE="$TMP_DIR/package.zip"
+LOCAL_ARCHIVE="${CMCC_LOCAL_ARCHIVE:-}"
 
-DOWNLOAD_URL="$(python3 - "$JSON" "$ASSET" <<'PY'
+if [[ -n "$LOCAL_ARCHIVE" && -f "$LOCAL_ARCHIVE" ]]; then
+  echo "使用本地安装包：$LOCAL_ARCHIVE"
+  cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
+elif [[ -f "./$ASSET" ]]; then
+  echo "发现当前目录安装包：./$ASSET"
+  cp -f "./$ASSET" "$ARCHIVE"
+else
+  for candidate in \
+    "/tmp/$ASSET" \
+    "/root/$ASSET" \
+    "/opt/$ASSET" \
+    "/opt/cmcc-linux-docker/$ASSET"; do
+    if [[ -f "$candidate" ]]; then
+      LOCAL_ARCHIVE="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$LOCAL_ARCHIVE" ]]; then
+    echo "发现本机安装包：$LOCAL_ARCHIVE"
+    cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
+  fi
+fi
+
+if [[ ! -s "$ARCHIVE" ]]; then
+  JSON="$TMP_DIR/release.json"
+  echo "本机未找到 $ASSET，读取 GitHub Release：${REPO} (${RELEASE_TAG})"
+  curl -fsSL --retry 3 --retry-delay 2 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: cmcc-cloud-alive-installer' \
+    "$API_URL" -o "$JSON"
+
+  DOWNLOAD_URL="$(python3 - "$JSON" "$ASSET" <<'PY'
 import json
 import sys
 
@@ -69,10 +99,10 @@ for asset in data.get("assets", []):
 PY
 )"
 
-if [[ -z "$DOWNLOAD_URL" ]]; then
-  echo "Release 中找不到资源：$ASSET" >&2
-  echo "可用资源：" >&2
-  python3 - "$JSON" <<'PY' >&2
+  if [[ -z "$DOWNLOAD_URL" ]]; then
+    echo "Release 中找不到资源：$ASSET" >&2
+    echo "可用资源：" >&2
+    python3 - "$JSON" <<'PY' >&2
 import json
 import sys
 
@@ -81,14 +111,14 @@ with open(sys.argv[1], encoding="utf-8") as f:
 for asset in data.get("assets", []):
     print("  " + str(asset.get("name", "")))
 PY
-  exit 1
-fi
+    exit 1
+  fi
 
-ARCHIVE="$TMP_DIR/package.zip"
-echo "下载：$ASSET"
-curl -fL --retry 3 --retry-delay 2 --progress-bar \
-  -H 'User-Agent: cmcc-cloud-alive-installer' \
-  "$DOWNLOAD_URL" -o "$ARCHIVE"
+  echo "下载：$ASSET"
+  curl -fL --retry 3 --retry-delay 2 --progress-bar \
+    -H 'User-Agent: cmcc-cloud-alive-installer' \
+    "$DOWNLOAD_URL" -o "$ARCHIVE"
+fi
 
 unzip -tq "$ARCHIVE"
 

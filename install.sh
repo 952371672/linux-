@@ -18,7 +18,8 @@ if [[ -z "$REPO" || ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
   exit 2
 fi
 
-for cmd in curl unzip sha256sum awk sed grep python3 find head; do
+echo "[1/7] 检查运行环境..." >&2
+for cmd in curl unzip sha256sum awk sed grep python3 find head du date; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "缺少命令：$cmd" >&2
     exit 1
@@ -26,7 +27,7 @@ for cmd in curl unzip sha256sum awk sed grep python3 find head; do
 done
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "未检测到 Docker，正在安装 Docker Engine..."
+  echo "未检测到 Docker，正在安装 Docker Engine..." >&2
   curl -fsSL https://get.docker.com | sh
 fi
 
@@ -56,8 +57,9 @@ if [[ -n "$LOCAL_ARCHIVE" && -f "$LOCAL_ARCHIVE" ]]; then
   echo "使用本地安装包：$LOCAL_ARCHIVE"
   cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
 elif [[ -f "./$ASSET" ]]; then
-  echo "发现当前目录安装包：./$ASSET"
-  cp -f "./$ASSET" "$ARCHIVE"
+  LOCAL_ARCHIVE="$(pwd)/$ASSET"
+  echo "发现当前目录安装包：$LOCAL_ARCHIVE"
+  cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
 else
   for candidate in \
     "/tmp/$ASSET" \
@@ -76,7 +78,9 @@ else
   fi
 fi
 
-if [[ ! -s "$ARCHIVE" ]]; then
+if [[ -n "$LOCAL_ARCHIVE" ]]; then
+  echo "[2/7] 使用本地安装包：$LOCAL_ARCHIVE" >&2
+else
   JSON="$TMP_DIR/release.json"
   echo "本机未找到 $ASSET，读取 GitHub Release：${REPO} (${RELEASE_TAG})"
   curl -fsSL --retry 3 --retry-delay 2 \
@@ -114,14 +118,25 @@ PY
     exit 1
   fi
 
-  echo "下载：$ASSET"
-  curl -fL --retry 3 --retry-delay 2 --progress-bar \
+  echo "[2/7] 开始下载：$ASSET" >&2
+  echo "下载地址：$DOWNLOAD_URL" >&2
+  echo "下载期间会显示进度条；如果进度长时间不变化，再按 Ctrl+C。" >&2
+  curl -fL --retry 3 --retry-delay 2 \
+    --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
+    --progress-bar --show-error \
     -H 'User-Agent: cmcc-cloud-alive-installer' \
     "$DOWNLOAD_URL" -o "$ARCHIVE"
+  echo >&2
+  echo "下载完成：$(du -h "$ARCHIVE" | awk '{print $1}')" >&2
 fi
 
-unzip -tq "$ARCHIVE"
+[[ -s "$ARCHIVE" ]] || { echo "安装包下载失败或文件为空。" >&2; exit 1; }
 
+echo "[3/7] 检查 ZIP 完整性..." >&2
+unzip -tq "$ARCHIVE"
+echo "ZIP 完整性检查通过。" >&2
+
+echo "[4/7] 解压安装包..." >&2
 STAGE="$TMP_DIR/stage"
 mkdir -p "$STAGE"
 unzip -q "$ARCHIVE" -d "$STAGE"
@@ -145,6 +160,7 @@ for required in novnc-Dockerfile novnc-compose.yml novnc-entrypoint.sh service.p
   }
 done
 
+echo "[5/7] 备份并安装文件..." >&2
 if [[ -e "$INSTALL_DIR/data/accounts.json" || -e "$INSTALL_DIR/data/.secret" ]]; then
   BACKUP="${INSTALL_DIR}.backup.$(date +%Y%m%d%H%M%S)"
   echo "发现已有运行数据，先备份到：$BACKUP"
@@ -171,8 +187,10 @@ EOF
   echo "已创建 $INSTALL_DIR/.env，请尽快修改 CMCC_WEBUI_PASSWORD。"
 fi
 
+echo "[6/7] 构建并启动 Docker..." >&2
 cd "$INSTALL_DIR"
 docker compose -f novnc-compose.yml up -d --build
+echo "[7/7] 检查容器状态..." >&2
 docker compose -f novnc-compose.yml ps
 
 echo

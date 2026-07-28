@@ -4,7 +4,7 @@ set -Eeuo pipefail
 APP_DIR="${APP_DIR:-/opt/cmcc-linux-docker}"
 REPO="${GITHUB_REPO:-952371672/linux-}"
 ASSET="${GITHUB_ASSET:-CMCC.Docker.zip}"
-TAG="${GITHUB_TAG:-正式版}"
+TAG="${GITHUB_TAG:-v20260728-cmcc}"
 PORT="${CMCC_PORT:-8080}"
 ARCHIVE_URL="${CMCC_ARCHIVE_URL:-https://github.com/${REPO}/releases/download/%E6%AD%A3%E5%BC%8F%E7%89%88/${ASSET}}"
 

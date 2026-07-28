@@ -1,201 +1,82 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# CMCC Cloud Alive one-click installer
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | bash -s -- OWNER/REPO
-# Optional:
-#   INSTALL_DIR=/opt/cmcc-linux-docker CMCC_ASSET=CMCC.Docker.zip bash -s -- OWNER/REPO
-#   CMCC_RELEASE_TAG=正式版 bash -s -- OWNER/REPO
+APP_DIR="${APP_DIR:-/opt/cmcc-linux-docker}"
+REPO="${GITHUB_REPO:-952371672/linux-}"
+ASSET="${GITHUB_ASSET:-CMCC.Docker.zip}"
+TAG="${GITHUB_TAG:-正式版}"
+PORT="${CMCC_PORT:-8080}"
+ARCHIVE_URL="${CMCC_ARCHIVE_URL:-https://github.com/${REPO}/releases/download/%E6%AD%A3%E5%BC%8F%E7%89%88/${ASSET}}"
 
-REPO="${1:-${CMCC_GITHUB_REPO:-}}"
-ASSET="${CMCC_ASSET:-CMCC.Docker.zip}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/cmcc-linux-docker}"
-RELEASE_TAG="${CMCC_RELEASE_TAG:-latest}"
+[[ "$(id -u)" == 0 ]] || { echo '请使用 root 或 sudo 运行'; exit 1; }
+for cmd in curl unzip docker find python3; do command -v "$cmd" >/dev/null || { echo "缺少命令：$cmd"; exit 1; }; done
+docker compose version >/dev/null 2>&1 || { echo '缺少 Docker Compose v2 插件'; exit 1; }
 
-if [[ -z "$REPO" || ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
-  echo "用法：curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | bash -s -- OWNER/REPO" >&2
-  exit 2
-fi
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+ARCHIVE="$TMP/$ASSET"
 
-echo "[1/7] 检查运行环境..." >&2
-for cmd in curl unzip sha256sum awk sed grep python3 find head du date; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "缺少命令：$cmd" >&2
-    exit 1
-  }
-done
+echo '[1/7] 检查依赖和安装目录'
+mkdir -p "$APP_DIR"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "未检测到 Docker，正在安装 Docker Engine..." >&2
-  curl -fsSL https://get.docker.com | sh
-fi
-
-if ! docker compose version >/dev/null 2>&1; then
-  echo "当前 Docker 缺少 Compose v2，请先安装 docker compose 插件。" >&2
-  exit 1
-fi
-
-if [[ "$RELEASE_TAG" == "latest" ]]; then
-  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-else
-  API_URL="https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}"
-fi
-
-TMP_DIR="$(mktemp -d)"
-cleanup() {
-  rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
-
-# 优先使用本机已有的安装包，避免重复下载。
-# 可显式指定：CMCC_LOCAL_ARCHIVE=/path/CMCC.Docker.zip
-ARCHIVE="$TMP_DIR/package.zip"
-LOCAL_ARCHIVE="${CMCC_LOCAL_ARCHIVE:-}"
-
-if [[ -n "$LOCAL_ARCHIVE" && -f "$LOCAL_ARCHIVE" ]]; then
-  echo "使用本地安装包：$LOCAL_ARCHIVE"
-  cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
-elif [[ -f "./$ASSET" ]]; then
-  LOCAL_ARCHIVE="$(pwd)/$ASSET"
-  echo "发现当前目录安装包：$LOCAL_ARCHIVE"
-  cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
-else
-  for candidate in \
-    "/tmp/$ASSET" \
-    "/root/$ASSET" \
-    "/opt/$ASSET" \
-    "/opt/cmcc-linux-docker/$ASSET"; do
-    if [[ -f "$candidate" ]]; then
-      LOCAL_ARCHIVE="$candidate"
-      break
-    fi
+# 优先使用本机现有安装包，避免无外网时仍访问 GitHub。
+FOUND="${CMCC_LOCAL_ARCHIVE:-}"
+if [[ -z "$FOUND" || ! -f "$FOUND" ]]; then
+  for candidate in "$(pwd)/$ASSET" "/tmp/$ASSET" "/root/$ASSET" "/opt/$ASSET" "$APP_DIR/$ASSET"; do
+    if [[ -f "$candidate" ]]; then FOUND="$candidate"; break; fi
   done
-
-  if [[ -n "$LOCAL_ARCHIVE" ]]; then
-    echo "发现本机安装包：$LOCAL_ARCHIVE"
-    cp -f "$LOCAL_ARCHIVE" "$ARCHIVE"
-  fi
 fi
-
-if [[ -n "$LOCAL_ARCHIVE" ]]; then
-  echo "[2/7] 使用本地安装包：$LOCAL_ARCHIVE" >&2
+if [[ -n "$FOUND" && -f "$FOUND" ]]; then
+  echo "[2/7] 使用本地安装包：$(readlink -f "$FOUND")"
+  cp -f "$FOUND" "$ARCHIVE"
 else
-  JSON="$TMP_DIR/release.json"
-  echo "本机未找到 $ASSET，读取 GitHub Release：${REPO} (${RELEASE_TAG})"
-  curl -fsSL --retry 3 --retry-delay 2 \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'User-Agent: cmcc-cloud-alive-installer' \
-    "$API_URL" -o "$JSON"
-
-  DOWNLOAD_URL="$(python3 - "$JSON" "$ASSET" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    data = json.load(f)
-
-wanted = sys.argv[2]
-for asset in data.get("assets", []):
-    if asset.get("name") == wanted:
-        print(asset.get("browser_download_url", ""))
-        break
-PY
-)"
-
-  if [[ -z "$DOWNLOAD_URL" ]]; then
-    echo "Release 中找不到资源：$ASSET" >&2
-    echo "可用资源：" >&2
-    python3 - "$JSON" <<'PY' >&2
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    data = json.load(f)
-for asset in data.get("assets", []):
-    print("  " + str(asset.get("name", "")))
-PY
-    exit 1
-  fi
-
-  echo "[2/7] 开始下载：$ASSET" >&2
-  echo "下载地址：$DOWNLOAD_URL" >&2
-  echo "下载期间会显示进度条；如果进度长时间不变化，再按 Ctrl+C。" >&2
-  curl -fL --retry 3 --retry-delay 2 \
-    --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
-    --progress-bar --show-error \
-    -H 'User-Agent: cmcc-cloud-alive-installer' \
-    "$DOWNLOAD_URL" -o "$ARCHIVE"
-  echo >&2
-  echo "下载完成：$(du -h "$ARCHIVE" | awk '{print $1}')" >&2
+  echo "[2/7] 下载 GitHub Release：$ASSET"
+  curl -fL --retry 3 --connect-timeout 20 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -o "$ARCHIVE" "$ARCHIVE_URL"
 fi
 
-[[ -s "$ARCHIVE" ]] || { echo "安装包下载失败或文件为空。" >&2; exit 1; }
-
-echo "[3/7] 检查 ZIP 完整性..." >&2
+[[ -s "$ARCHIVE" ]] || { echo '安装包为空'; exit 1; }
+echo '[3/7] 校验并解压安装包'
 unzip -tq "$ARCHIVE"
-echo "ZIP 完整性检查通过。" >&2
+rm -rf "$TMP/unpack"; mkdir -p "$TMP/unpack"
+unzip -q "$ARCHIVE" -d "$TMP/unpack"
+DOCKERFILE="$(find "$TMP/unpack" -type f -name novnc-Dockerfile -print -quit)"
+[[ -n "$DOCKERFILE" ]] || { echo '安装包中找不到 novnc-Dockerfile'; exit 1; }
+SRC="$(dirname "$DOCKERFILE")"
 
-echo "[4/7] 解压安装包..." >&2
-STAGE="$TMP_DIR/stage"
-mkdir -p "$STAGE"
-unzip -q "$ARCHIVE" -d "$STAGE"
+COMPOSE="$SRC/novnc-compose.yml"
+[[ -f "$COMPOSE" ]] || { echo '安装包中找不到 novnc-compose.yml'; exit 1; }
 
-# 不依赖 ZIP 顶层目录名称，自动定位项目实际目录。
-PAYLOAD_FILE="$(find "$STAGE" -type f -name 'novnc-Dockerfile' -print -quit)"
+echo '[4/7] 停止旧容器并保留运行数据'
+if [[ -f "$APP_DIR/novnc-compose.yml" ]]; then docker compose -f "$APP_DIR/novnc-compose.yml" down || true; fi
+if [[ -f "$APP_DIR/docker-compose.yml" ]]; then docker compose -f "$APP_DIR/docker-compose.yml" down || true; fi
+mkdir -p "$APP_DIR/data"
+BACKUP="$TMP/old-files"; mkdir -p "$BACKUP"
+[[ -f "$APP_DIR/.env" ]] && cp -a "$APP_DIR/.env" "$BACKUP/.env"
+[[ -f "$APP_DIR/data/webui-auth.json" ]] && cp -a "$APP_DIR/data/webui-auth.json" "$BACKUP/webui-auth.json"
 
-if [[ -z "$PAYLOAD_FILE" ]]; then
-  echo "安装包缺少文件：novnc-Dockerfile" >&2
-  echo "ZIP 解压后的文件列表：" >&2
-  find "$STAGE" -maxdepth 4 -type f -printf '  %P\n' | head -80 >&2 || true
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} +
+cp -a "$SRC"/. "$APP_DIR"/
+[[ -f "$BACKUP/.env" ]] && cp -a "$BACKUP/.env" "$APP_DIR/.env"
+[[ -f "$BACKUP/webui-auth.json" ]] && cp -a "$BACKUP/webui-auth.json" "$APP_DIR/data/webui-auth.json"
+chmod 600 "$APP_DIR/.env" 2>/dev/null || true
+
+if [[ "$PORT" != 8080 ]]; then sed -i "s/\"8080:8080\"/\"${PORT}:8080\"/" "$APP_DIR/novnc-compose.yml"; fi
+
+echo '[5/7] 检查 Docker 架构和配置'
+case "$(uname -m)" in x86_64|amd64) echo 'amd64：可部署';; *) echo "警告：架构 $(uname -m)，官方客户端只验证过 amd64";; esac
+cd "$APP_DIR"
+docker compose -f novnc-compose.yml config >/dev/null
+
+echo '[6/7] 构建镜像'
+docker compose -f novnc-compose.yml build
+
+echo '[7/7] 启动服务并健康检查'
+docker compose -f novnc-compose.yml up -d
+sleep 5
+if curl -fsS -u "${CMCC_WEBUI_USER:-admin}:${CMCC_WEBUI_PASSWORD:-change-this-immediately}" "http://127.0.0.1:${PORT}/health" >/dev/null; then
+  echo '部署完成，健康检查通过'
+else
+  echo '容器已启动但健康检查失败；请检查：docker compose -f novnc-compose.yml logs --tail=100' >&2
   exit 1
 fi
-
-ROOT="$(dirname "$PAYLOAD_FILE")"
-
-for required in novnc-Dockerfile novnc-compose.yml novnc-entrypoint.sh service.py webui/index.html; do
-  [[ -e "$ROOT/$required" ]] || {
-    echo "安装包缺少文件：$required" >&2
-    exit 1
-  }
-done
-
-echo "[5/7] 备份并安装文件..." >&2
-if [[ -e "$INSTALL_DIR/data/accounts.json" || -e "$INSTALL_DIR/data/.secret" ]]; then
-  BACKUP="${INSTALL_DIR}.backup.$(date +%Y%m%d%H%M%S)"
-  echo "发现已有运行数据，先备份到：$BACKUP"
-  mkdir -p "$BACKUP"
-  cp -a "$INSTALL_DIR/data" "$BACKUP/"
-  [[ -e "$INSTALL_DIR/.env" ]] && cp -a "$INSTALL_DIR/.env" "$BACKUP/"
-fi
-
-mkdir -p "$INSTALL_DIR"
-cp -a "$ROOT"/. "$INSTALL_DIR"/
-mkdir -p "$INSTALL_DIR/data/profiles"
-chmod 700 "$INSTALL_DIR/data/profiles"
-
-if [[ ! -e "$INSTALL_DIR/.env" ]]; then
-  if [[ -e "$INSTALL_DIR/.env.example" ]]; then
-    cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
-  else
-    cat > "$INSTALL_DIR/.env" <<'EOF'
-CMCC_WEBUI_USER=admin
-CMCC_WEBUI_PASSWORD=change-this-immediately
-EOF
-  fi
-  chmod 600 "$INSTALL_DIR/.env"
-  echo "已创建 $INSTALL_DIR/.env，请尽快修改 CMCC_WEBUI_PASSWORD。"
-fi
-
-echo "[6/7] 构建并启动 Docker..." >&2
-cd "$INSTALL_DIR"
-docker compose -f novnc-compose.yml up -d --build
-echo "[7/7] 检查容器状态..." >&2
-docker compose -f novnc-compose.yml ps
-
-echo
-echo "安装完成：$INSTALL_DIR"
-HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-echo "WebUI：http://${HOST_IP:-服务器IP}:8080"
-echo "noVNC：http://${HOST_IP:-服务器IP}:6080/vnc.html"
-echo "查看日志：cd $INSTALL_DIR && docker compose -f novnc-compose.yml logs --tail 100 -f"
+echo "WebUI: http://$(hostname -I 2>/dev/null | awk '{print $1}'):${PORT}/"
+echo "目录: $APP_DIR"

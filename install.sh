@@ -14,7 +14,7 @@ FOUND="${CMCC_LOCAL_ARCHIVE:-}"
 if [[ -z "$FOUND" || ! -f "$FOUND" ]]; then for p in "$(pwd)/$ASSET" "/tmp/$ASSET" "/root/$ASSET" "/opt/$ASSET" "$APP_DIR/$ASSET"; do [[ -f "$p" ]] && { FOUND="$p"; break; }; done; fi
 ARCHIVE="$TMP/$ASSET"
 if [[ -n "$FOUND" && -f "$FOUND" ]]; then echo "[2/7] 使用本地安装包：$(readlink -f "$FOUND")"; cp -f "$FOUND" "$ARCHIVE"; else
- echo '[2/7] 获取最新正式 Release'; curl -fsSL --retry 3 --connect-timeout 20 "$API" -o "$TMP/release.json"
+ echo '[2/7] 获取最新正式 Release'; curl --http1.1 -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 "$API" -o "$TMP/release.json"
  URL="$(python3 - "$TMP/release.json" "$ASSET" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1],encoding='utf8'))
@@ -23,7 +23,7 @@ for a in p.get('assets',[]):
 else: raise SystemExit('最新 Release 中找不到 '+sys.argv[2])
 PY
 )"
- [[ -n "$URL" ]] || exit 1; echo "下载：$URL"; curl -fL --retry 3 --connect-timeout 20 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -o "$ARCHIVE" "$URL"
+ [[ -n "$URL" ]] || exit 1; echo "下载：$URL"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -o "$ARCHIVE" "$URL"
 fi
 [[ -s "$ARCHIVE" ]] || { echo '安装包为空'; exit 1; }
 echo '[3/7] 校验并解压'; unzip -tq "$ARCHIVE"; mkdir -p "$TMP/unpack"; unzip -q "$ARCHIVE" -d "$TMP/unpack"; DF="$(find "$TMP/unpack" -type f -name novnc-Dockerfile -print -quit)"; [[ -n "$DF" ]] || exit 1; SRC="$(dirname "$DF")"; [[ -f "$SRC/novnc-compose.yml" ]] || exit 1

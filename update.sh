@@ -13,7 +13,7 @@ echo '[1/7] 检查依赖和目录'; mkdir -p "$APP_DIR"
 FOUND="${CMCC_LOCAL_ARCHIVE:-}"
 if [[ -z "$FOUND" || ! -f "$FOUND" ]]; then for p in "$(pwd)/$ASSET" "/tmp/$ASSET" "/root/$ASSET" "/opt/$ASSET" "$APP_DIR/$ASSET"; do [[ -f "$p" ]] && { FOUND="$p"; break; }; done; fi
 ARCHIVE="$TMP/$ASSET"
-RELEASE_MARKER="$APP_DIR/.cmcc-release.json"
+RELEASE_MARKER="$APP_DIR/data/.cmcc-release.json"
 if [[ -n "$FOUND" && -f "$FOUND" ]]; then
  echo "[2/7] 使用本地安装包：$(readlink -f "$FOUND")"; cp -f "$FOUND" "$ARCHIVE"
 else

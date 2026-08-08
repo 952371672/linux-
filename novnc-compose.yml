@@ -6,8 +6,8 @@ services:
     platform: linux/amd64
     init: true
     environment:
-      CMCC_WEBUI_USER: ${CMCC_WEBUI_USER}
-      CMCC_WEBUI_PASSWORD: ${CMCC_WEBUI_PASSWORD}
+      CMCC_WEBUI_USER: ${CMCC_WEBUI_USER:-admin}
+      CMCC_WEBUI_PASSWORD: ${CMCC_WEBUI_PASSWORD:-admin}
       CMCC_WEBUI_REALM: CMCC Keepalive
       TZ: Asia/Shanghai
     ports:

@@ -101,56 +101,51 @@ docker image prune -a
 
 ## WebUI 首次登录密码（重要）
 
-本项目**没有统一的默认密码**，安装脚本也不会使用固定的公开密码。WebUI 的账号密码来自项目目录下的 `.env`：
+全新安装的默认 WebUI 登录凭据固定为：
 
-```env
-CMCC_WEBUI_USER=admin
-CMCC_WEBUI_PASSWORD=请设置一个强密码
+```text
+用户名：admin
+密码：admin
 ```
 
-首次安装前，如果没有 `.env`，请先创建并设置密码：
-
-```bash
-mkdir -p /opt/cmcc-linux-docker
-cat > /opt/cmcc-linux-docker/.env <<'EOF'
-CMCC_WEBUI_USER=admin
-CMCC_WEBUI_PASSWORD=请替换为你自己的强密码
-EOF
-chmod 600 /opt/cmcc-linux-docker/.env
-```
-
-然后再执行安装脚本。登录地址为：
+登录地址：
 
 ```text
 http://服务器IP:8080/
 ```
 
-用户名是 `.env` 中的 `CMCC_WEBUI_USER`，密码是 `.env` 中的 `CMCC_WEBUI_PASSWORD`。安装或更新脚本会保留已有 `.env`，不会覆盖现有 WebUI 密码。
+首次登录后，请立即点击页面顶部“修改密码”设置强密码。安装脚本只会在没有已有 `.env` 时创建以下配置：
 
-如果已经安装但忘记密码，可以直接修改：
-
-```bash
-cd /opt/cmcc-linux-docker
-nano .env
-# 修改 CMCC_WEBUI_PASSWORD 后保存
-
-docker compose -f novnc-compose.yml up -d --force-recreate
+```env
+CMCC_WEBUI_USER=admin
+CMCC_WEBUI_PASSWORD=admin
 ```
 
-也可以使用页面顶部的“修改密码”功能修改。修改后的密码会保存到：
+已有安装或更新时，脚本会保留原来的 `.env` 和 `data/webui-auth.json`，不会强制覆盖已有密码。如果之前通过页面修改过密码，运行时以以下文件为准：
 
 ```text
 /opt/cmcc-linux-docker/data/webui-auth.json
 ```
 
-运行时 `webui-auth.json` 的密码优先级高于 `.env`。忘记运行时密码时，应删除该文件后重启容器，使服务重新使用 `.env` 中的密码：
+忘记运行时密码时，可以删除运行时覆盖后重启，使服务重新使用 `.env`：
 
 ```bash
 rm -f /opt/cmcc-linux-docker/data/webui-auth.json
 docker compose -f /opt/cmcc-linux-docker/novnc-compose.yml up -d --force-recreate
 ```
 
-> 请不要把真实密码提交到 GitHub、CNB、README、日志或聊天记录中。
+如果 `.env` 也被删除，重新创建默认配置：
+
+```bash
+cat > /opt/cmcc-linux-docker/.env <<'EOF'
+CMCC_WEBUI_USER=admin
+CMCC_WEBUI_PASSWORD=admin
+EOF
+chmod 600 /opt/cmcc-linux-docker/.env
+docker compose -f /opt/cmcc-linux-docker/novnc-compose.yml up -d --force-recreate
+```
+
+> `admin/admin` 仅用于首次登录，部署完成后必须立即修改。不要把修改后的真实密码提交到 GitHub、CNB、README、日志或聊天记录中。
 
 
 账号列表中：

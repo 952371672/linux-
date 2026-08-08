@@ -1,0 +1,13 @@
+services:
+  cmcc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    ports:
+      - "${CMCC_PORT:-8080}:8080"
+      - "${CMCC_VNC_PORT:-6080}:6080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    shm_size: "1gb"

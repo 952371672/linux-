@@ -1,0 +1,12 @@
+services:
+  cmcc:
+    build:
+      context: .
+      dockerfile: stable-Dockerfile
+    platform: linux/amd64
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    shm_size: "1gb"

@@ -6,7 +6,7 @@ mkdir -p /home/cmcc/.config
 # Remove stale X11 lock/socket files left by an unclean container/client exit.
 # Without this, Xvfb exits immediately with 'Server is already active', and
 # every fallback slot later fails with CDP page target unavailable.
-for d in 99 100 101 102 103 104 105; do
+for d in 99 100 101 102 103 104 105 106 107; do
   if ! kill -0 "$(cat /tmp/.X${d}-lock 2>/dev/null)" 2>/dev/null; then
     rm -f "/tmp/.X${d}-lock" "/tmp/.X11-unix/X${d}"
   fi
@@ -23,6 +23,10 @@ Xvfb :104 -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb
 XVFB104=$!
 Xvfb :105 -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb-105.log" 2>&1 &
 XVFB105=$!
+Xvfb :106 -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb-106.log" 2>&1 &
+XVFB106=$!
+Xvfb :107 -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb-107.log" 2>&1 &
+XVFB107=$!
 Xvfb "$DISPLAY" -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb.log" 2>&1 &
 XVFB=$!
 openbox --display "$DISPLAY" >"$HOME/openbox.log" 2>&1 &
@@ -39,8 +43,10 @@ slot2:127.0.0.1:5903
 slot3:127.0.0.1:5904
 slot4:127.0.0.1:5905
 slot5:127.0.0.1:5906
+slot6:127.0.0.1:5907
+slot7:127.0.0.1:5908
 EOF
-for display_port in '100 5901' '101 5902' '102 5903' '103 5904' '104 5905' '105 5906'; do
+for display_port in '100 5901' '101 5902' '102 5903' '103 5904' '104 5905' '105 5906' '106 5907' '107 5908'; do
   set -- $display_port; d=":$1"; p="$2"
   for retry in 1 2 3 4 5; do
     xdpyinfo -display "$d" >/dev/null 2>&1 && break
@@ -50,7 +56,7 @@ for display_port in '100 5901' '101 5902' '102 5903' '103 5904' '104 5905' '105 
 done
 websockify --web=/usr/share/novnc --token-plugin=TokenFile --token-source=/data/vnc.tokens 6080 >"$HOME/novnc.log" 2>&1 &
 NOVNC=$!
-trap 'kill "$NOVNC" "$X11VNC" "$OPENBOX" "$XVFB" "$XVFB100" "$XVFB101" "$XVFB102" "$XVFB103" "$XVFB104" "$XVFB105" 2>/dev/null || true' EXIT
+trap 'kill "$NOVNC" "$X11VNC" "$OPENBOX" "$XVFB" "$XVFB100" "$XVFB101" "$XVFB102" "$XVFB103" "$XVFB104" "$XVFB105" "$XVFB106" "$XVFB107" 2>/dev/null || true' EXIT
 sleep 2
 unset LD_LIBRARY_PATH GST_PLUGIN_PATH GST_PLUGIN_PATH_1_0 CY_BIN_PATH CY_CCSDK_PATH
 exec su -s /bin/bash cmcc -c 'exec env -u LD_LIBRARY_PATH -u GST_PLUGIN_PATH -u GST_PLUGIN_PATH_1_0 python3 -m uvicorn service:app --host 0.0.0.0 --port 8080'

@@ -5,7 +5,7 @@ Execution order: resident probe scheduler -> local SDK/connectWorker -> ordinary
 CDP click fallback.  The WebUI exposes every stage so a stuck account is visible.
 """
 from __future__ import annotations
-import asyncio, csv, io, json, os, random, re, secrets, subprocess, time, urllib.request, base64, contextvars, hmac, hashlib, uuid, concurrent.futures
+import asyncio, csv, io, json, os, random, re, secrets, subprocess, time, urllib.request, base64, contextvars, hmac, hashlib, uuid, concurrent.futures, threading
 from urllib.request import Request as UrlRequest, urlopen
 from cryptography.hazmat.primitives import serialization
 from pathlib import Path
@@ -62,9 +62,18 @@ active_clients:dict[str,tuple[Any,Any]]={}
 probe_last:dict[str,tuple[str,float]]={}
 probe_initialized:set[str]=set()
 PROBE_INTERVAL=10; PROBE_CONSECUTIVE=2
-# Six isolated client slots. This is a controlled expansion from the verified
-# four-slot deployment; each slot owns its display, CDP port and profile.
-FALLBACK_CONCURRENCY=6
+RUNTIME_CONFIG=ROOT/"runtime-config.json"
+CONFIG_LOCK=threading.Lock()
+def _load_runtime_config():
+    try:
+        x=json.loads(RUNTIME_CONFIG.read_text("utf-8"))
+        return {"probe_interval":max(5,min(300,int(x.get("probe_interval",10)))),"fallback_concurrency":max(1,min(8,int(x.get("fallback_concurrency",6))))}
+    except Exception:return {"probe_interval":10,"fallback_concurrency":6}
+_runtime_config=_load_runtime_config()
+PROBE_INTERVAL=_runtime_config["probe_interval"]
+FALLBACK_CONCURRENCY=_runtime_config["fallback_concurrency"]
+# Eight isolated client slots are provisioned at startup; the UI limit controls
+# how many may be occupied, without creating displays/CDP ports dynamically.
 CLIENT_SLOTS=(
     {"name":"slot0","display":":100","port":9223},
     {"name":"slot1","display":":101","port":9224},
@@ -72,8 +81,24 @@ CLIENT_SLOTS=(
     {"name":"slot3","display":":103","port":9226},
     {"name":"slot4","display":":104","port":9227},
     {"name":"slot5","display":":105","port":9228},
+    {"name":"slot6","display":":106","port":9229},
+    {"name":"slot7","display":":107","port":9230},
 )
-fallback_slots=asyncio.Semaphore(FALLBACK_CONCURRENCY)
+class DynamicSlotLimiter:
+    def __init__(self, limit):
+        self.limit=max(1,min(len(CLIENT_SLOTS),int(limit))); self.active=0; self.condition=asyncio.Condition()
+    async def acquire(self):
+        async with self.condition:
+            await self.condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+    async def release(self):
+        async with self.condition:
+            self.active=max(0,self.active-1); self.condition.notify_all()
+    async def __aenter__(self): await self.acquire(); return self
+    async def __aexit__(self,*args): await self.release()
+    def set_limit(self,value): self.limit=max(1,min(len(CLIENT_SLOTS),int(value)))
+
+fallback_slots=DynamicSlotLimiter(FALLBACK_CONCURRENCY)
 fallback_active:set[str]=set()
 account_slots:dict[str,dict[str,Any]]={}
 slot_pool=asyncio.Queue()
@@ -91,6 +116,30 @@ def read_accounts():
     except Exception:return {}
 def write_accounts(x):
     t=ACCOUNTS.with_suffix(".tmp"); t.write_text(json.dumps(x,ensure_ascii=False,indent=2),"utf-8"); t.replace(ACCOUNTS); ACCOUNTS.chmod(0o600)
+EVENTS_MAX_BYTES=int(os.environ.get("CMCC_EVENTS_MAX_BYTES","52428800"))
+EVENTS_BACKUPS=max(1,int(os.environ.get("CMCC_EVENTS_BACKUPS","5")))
+_events_lock=threading.Lock()
+_events_size_check=0
+
+def _append_event_line(line):
+    """Append JSONL with bounded rotation; safe for concurrent worker threads."""
+    global _events_size_check
+    with _events_lock:
+        # Check the size before writing so the active file never grows without a bound.
+        try: size=EVENTS.stat().st_size
+        except FileNotFoundError: size=0
+        if size and size+len(line.encode("utf-8"))>EVENTS_MAX_BYTES:
+            oldest=Path(str(EVENTS)+f".{EVENTS_BACKUPS}")
+            try: oldest.unlink()
+            except FileNotFoundError: pass
+            for n in range(EVENTS_BACKUPS-1,0,-1):
+                src=Path(str(EVENTS)+f".{n}"); dst=Path(str(EVENTS)+f".{n+1}")
+                if src.exists(): src.replace(dst)
+            EVENTS.replace(Path(str(EVENTS)+".1"))
+        with EVENTS.open("a",encoding="utf-8", buffering=1) as f:
+            f.write(line); f.flush()
+        _events_size_check += 1
+
 def event(key,status,**extra):
     x={"time":time.strftime("%Y-%m-%d %H:%M:%S"),"account":key,"status":status,**extra}; states[key]=x
     # Keep a redacted, bounded page snapshot for WebUI diagnostics. Never store
@@ -101,7 +150,7 @@ def event(key,status,**extra):
             snap={k:v for k,v in snap.items() if k in ("url","title","body","inputs","buttons","target_count")}
             snap["body"]=str(snap.get("body", ""))[:2200]
             x["page_snapshot"]=snap
-    with EVENTS.open("a",encoding="utf-8", buffering=1) as f:f.write(json.dumps(x,ensure_ascii=False)+"\n"); f.flush()
+    _append_event_line(json.dumps(x,ensure_ascii=False)+"\n")
 def normalize_login_mode(value):
     v=str(value or '').strip().lower()
     return "sub" if v in ("sub","subaccount","sub_account","sub_password","sub_login","子账号","子帐号","子账号登录") else "main"
@@ -970,13 +1019,13 @@ async def run_once(key,cfg):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.
     async with fallback_slots:
         slot=await slot_pool.get(); token=current_slot.set(slot)
-        fallback_active.add(key); account_slots[key]=slot; event(key,"fallback_slot_acquired",stage=f"已取得兜底保活槽位 {slot['name']}（并发上限{FALLBACK_CONCURRENCY}）",active=list(fallback_active),limit=FALLBACK_CONCURRENCY,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
+        fallback_active.add(key); account_slots[key]=slot; event(key,"fallback_slot_acquired",stage=f"已取得兜底保活槽位 {slot['name']}（并发上限{fallback_slots.limit}）",active=list(fallback_active),limit=fallback_slots.limit,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
         try:
             return await _run_once_heavy(key,cfg,slot)
         finally:
             stop_active_client(key)
             reap_children()
-            fallback_active.discard(key); account_slots.pop(key,None); event(key,"fallback_slot_released",stage=f"已释放兜底保活槽位 {slot['name']}",active=list(fallback_active),limit=FALLBACK_CONCURRENCY,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
+            fallback_active.discard(key); account_slots.pop(key,None); event(key,"fallback_slot_released",stage=f"已释放兜底保活槽位 {slot['name']}",active=list(fallback_active),limit=fallback_slots.limit,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
             for _ in range(10):
                 try:
                     if not page_targets(slot["port"]): break
@@ -1072,7 +1121,7 @@ async def worker(key):
             if key in stopped_accounts:return
             await asyncio.sleep(PROBE_INTERVAL)
 async def probe_scheduler():
-    event("_scheduler","scheduler",stage=f"实时探针运行中：每{PROBE_INTERVAL}秒扫描，SDK优先、点击兜底")
+    event("_scheduler","scheduler",stage=f"实时探针运行中：每{PROBE_INTERVAL}秒扫描，协议探针正常跳过，SDK失败后点击兜底")
     while True:
         try:
             for k,cfg in read_accounts().items():
@@ -1110,8 +1159,25 @@ def live_page(key):
     if key not in read_accounts(): raise HTTPException(404,"account not found")
     return FileResponse("/opt/cmcc-app/webui/live.html",media_type="text/html",headers={"Cache-Control":"no-store"})
 
+@app.get("/runtime-config")
+def runtime_config():
+    return {"probe_interval":PROBE_INTERVAL,"fallback_concurrency":fallback_slots.limit,"active_slots":len(fallback_active),"max_slots":len(CLIENT_SLOTS)}
+class RuntimeConfigIn(BaseModel):
+    probe_interval:int=Field(ge=5,le=300)
+    fallback_concurrency:int=Field(ge=1,le=8)
+@app.post("/runtime-config")
+def update_runtime_config(x:RuntimeConfigIn):
+    global PROBE_INTERVAL
+    with CONFIG_LOCK:
+        PROBE_INTERVAL=x.probe_interval
+        fallback_slots.set_limit(x.fallback_concurrency)
+        RUNTIME_CONFIG.write_text(json.dumps({"probe_interval":PROBE_INTERVAL,"fallback_concurrency":fallback_slots.limit},ensure_ascii=False,indent=2),"utf-8")
+        RUNTIME_CONFIG.chmod(0o600)
+    event("_scheduler","runtime_config",stage=f"运行参数已更新：探针每{PROBE_INTERVAL}秒，槽位上限{fallback_slots.limit}",probe_interval=PROBE_INTERVAL,fallback_concurrency=fallback_slots.limit)
+    return runtime_config()
+
 @app.get("/health")
-def health():return {"ok":True,"version":"1.4.0","accounts":len(read_accounts()),"running":[k for k,v in tasks.items() if not v.done()],"scheduler":"running" if scheduler_task and not scheduler_task.done() else "stopped","fallback_concurrency":FALLBACK_CONCURRENCY,"fallback_active":list(fallback_active),"client_slots":[{"name":s["name"],"display":s["display"],"cdp_port":s["port"]} for s in CLIENT_SLOTS]}
+def health():return {"ok":True,"version":"1.4.0","accounts":len(read_accounts()),"running":[k for k,v in tasks.items() if not v.done()],"scheduler":"running" if scheduler_task and not scheduler_task.done() else "stopped","fallback_concurrency":fallback_slots.limit,"fallback_active":list(fallback_active),"client_slots":[{"name":s["name"],"display":s["display"],"cdp_port":s["port"]} for s in CLIENT_SLOTS]}
 class PasswordChange(BaseModel):
     current_password:str=Field(min_length=1,max_length=300)
     new_password:str=Field(min_length=8,max_length=300)

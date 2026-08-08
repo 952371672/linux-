@@ -66,12 +66,13 @@ curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
 
 安装脚本会自动完成：
 
-1. 下载固定发布资产 `stable-latest/CMCC.Docker.zip`；
-2. 解压项目文件；
-3. 保留已有 `data/`、`.env` 和 WebUI 认证配置；
-4. 构建 amd64 Docker 镜像；
-5. 启动 `cmcc-linux-docker-cmcc-1`；
-6. 检查容器和健康状态。
+1. GitHub脚本从GitHub Release下载 `stable-latest/CMCC.Docker.zip`；
+2. CNB脚本从CNB公开OCI制品下载 `stable-latest` 中的 `CMCC.Docker.zip`，安装设备不需要CNB Token；
+3. 解压项目文件；
+4. 保留已有 `data/`、`.env` 和 WebUI 认证配置；
+5. 构建 amd64 Docker 镜像；
+6. 启动 `cmcc-linux-docker-cmcc-1`；
+7. 检查容器和健康状态。
 
 如果服务器访问 GitHub 受限，也可以先将 `CMCC.Docker.zip` 放在当前目录，安装脚本会优先使用本地压缩包。
 

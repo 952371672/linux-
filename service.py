@@ -72,8 +72,8 @@ def _load_runtime_config():
 _runtime_config=_load_runtime_config()
 PROBE_INTERVAL=_runtime_config["probe_interval"]
 FALLBACK_CONCURRENCY=_runtime_config["fallback_concurrency"]
-# Eight isolated client slots are provisioned at startup; the UI limit controls
-# how many may be occupied, without creating displays/CDP ports dynamically.
+# Eight slot identities retain stable DISPLAY/CDP/VNC numbers, but the heavy
+# display processes are created only when a slot is acquired.
 CLIENT_SLOTS=(
     {"name":"slot0","display":":100","port":9223},
     {"name":"slot1","display":":101","port":9224},
@@ -103,6 +103,52 @@ fallback_active:set[str]=set()
 account_slots:dict[str,dict[str,Any]]={}
 slot_pool=asyncio.Queue()
 current_slot=contextvars.ContextVar("cmcc_current_slot",default=CLIENT_SLOTS[0])
+slot_runtime:dict[str,dict[str,Any]]={}
+
+def create_slot_runtime(slot):
+    """Create display/VNC only while a heavy client owns this slot."""
+    name=slot["name"]; display=slot["display"]; vnc=5901+int(name[4:])
+    if name in slot_runtime:return
+    display_num=display.lstrip(":")
+    try:
+        lock=Path(f"/tmp/.X{display_num}-lock")
+        owner=int(lock.read_text().strip()) if lock.exists() else 0
+        if not owner or not Path(f"/proc/{owner}").exists():
+            lock.unlink(missing_ok=True); Path(f"/tmp/.X11-unix/X{display_num}").unlink(missing_ok=True)
+    except Exception: pass
+    env=os.environ.copy(); env["DISPLAY"]=display
+    log_base=ROOT/("slot-"+name)
+    xvfb_log=open(str(log_base)+"-xvfb.log","a",buffering=1)
+    xvfb=subprocess.Popen(["Xvfb",display,"-screen","0","1280x800x24","-ac","+extension","GLX","+render","-noreset"],env=env,stdout=xvfb_log,stderr=subprocess.STDOUT,start_new_session=True)
+    try:
+        ready=False
+        for _ in range(30):
+            try:
+                subprocess.run(["xdpyinfo","-display",display],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=1,check=True); ready=True; break
+            except Exception: time.sleep(.2)
+        if not ready: raise RuntimeError(f"Xvfb未就绪：{display}")
+        vnc_log=open(str(log_base)+"-vnc.log","a",buffering=1)
+        vnc_proc=subprocess.Popen(["x11vnc","-display",display,"-forever","-shared","-nopw","-noxdamage","-repeat","-rfbport",str(vnc)],env=env,stdout=vnc_log,stderr=subprocess.STDOUT,start_new_session=True)
+        slot_runtime[name]={"xvfb":xvfb,"xvfb_log":xvfb_log,"vnc":vnc_proc,"vnc_log":vnc_log}
+    except Exception:
+        try: os.killpg(xvfb.pid,9)
+        except Exception: pass
+        xvfb_log.close()
+        raise
+
+def destroy_slot_runtime(slot):
+    r=slot_runtime.pop(slot["name"],None)
+    if not r:return
+    for key in ("vnc","xvfb"):
+        p=r.get(key)
+        if p:
+            try: os.killpg(p.pid,15); p.wait(timeout=3)
+            except Exception:
+                try: os.killpg(p.pid,9)
+                except Exception: pass
+    for key in ("vnc_log","xvfb_log"):
+        try:r[key].close()
+        except Exception:pass
 
 class AccountIn(BaseModel):
     username:str=Field(min_length=1,max_length=200); password:str=Field(min_length=1,max_length=300)
@@ -1019,6 +1065,11 @@ async def run_once(key,cfg):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.
     async with fallback_slots:
         slot=await slot_pool.get(); token=current_slot.set(slot)
+        try:
+            create_slot_runtime(slot)
+        except Exception:
+            slot_pool.put_nowait(slot); current_slot.reset(token)
+            raise
         fallback_active.add(key); account_slots[key]=slot; event(key,"fallback_slot_acquired",stage=f"已取得兜底保活槽位 {slot['name']}（并发上限{fallback_slots.limit}）",active=list(fallback_active),limit=fallback_slots.limit,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
         try:
             return await _run_once_heavy(key,cfg,slot)
@@ -1032,7 +1083,7 @@ async def run_once(key,cfg):
                 except Exception: break
                 await asyncio.sleep(.3)
             reap_children()
-            slot_pool.put_nowait(slot); current_slot.reset(token)
+            destroy_slot_runtime(slot); slot_pool.put_nowait(slot); current_slot.reset(token)
 
 async def _run_once_heavy(key,cfg,slot):
     profile=PROFILES/key;profile.mkdir(parents=True,exist_ok=True);p=log=ws=None

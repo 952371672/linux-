@@ -1,0 +1,19 @@
+services:
+  cmcc:
+    build:
+      context: .
+      dockerfile: novnc-Dockerfile
+    platform: linux/amd64
+    init: true
+    environment:
+      CMCC_WEBUI_USER: ${CMCC_WEBUI_USER}
+      CMCC_WEBUI_PASSWORD: ${CMCC_WEBUI_PASSWORD}
+      CMCC_WEBUI_REALM: CMCC Keepalive
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+      - "6080:6080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    shm_size: "1gb"

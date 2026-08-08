@@ -258,3 +258,12 @@ curl -I http://127.0.0.1:6080/vnc.html
 
 - GitHub：<https://github.com/952371672/linux->
 - CNB：<https://cnb.cool/952371672/cmcc-linux-docker>
+
+## 稳定性修复说明
+
+当前版本包含以下修复：
+
+- 已认证的 `#/home` 云电脑业务页即使暂时显示“暂无任何匹配结果”，也不会再被误判为登录页切换失败；
+- 隐私确认后如果 Electron 替换 renderer，会重新发现当前页面并在有限次数内重试；
+- CDP 遇到 `No such target id`、旧 WebSocket 失效或远程连接短暂断开时，会重新附着当前页面；
+- 业务页状态会优先于登录表单判断，减少重复登录和客户端重启。

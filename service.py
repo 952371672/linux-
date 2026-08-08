@@ -340,11 +340,14 @@ def page_targets(port=None):
     try:return http_json(f"http://127.0.0.1:{port}/json/list")
     except Exception:return []
 def page_target(port=None):
-    """Pick the current Electron business page; browser target is fallback only."""
+    """Pick the newest usable Electron page, preferring the authenticated app target."""
     xs=page_targets(port)
     usable=[x for x in xs if x.get("webSocketDebuggerUrl") and x.get("type") in ("page","webview")]
     if not usable:
         usable=[x for x in xs if x.get("webSocketDebuggerUrl") and x.get("url","").startswith("file:")]
+    # Electron can leave an old target beside the new renderer during navigation.
+    # Prefer the newest target and the app shell/business route over start.html.
+    usable.sort(key=lambda x:("#/home" in str(x.get("url",'')) or "#/login" in str(x.get("url",'')), "start.html" not in str(x.get("url",'')), str(x.get("id",''))),reverse=True)
     return usable[0] if usable else None
 def kill_profile_clients(profile):
     """Kill the complete stale Electron tree owning one persisted profile.
@@ -650,6 +653,25 @@ async def wait_page_or_api(timeout=60,key=None,profile=None,log=None,port=None):
         await asyncio.sleep(1)
     raise TimeoutError("CDP page target unavailable")
 
+def cdp_target_error(exc):
+    s=str(exc)
+    return any(x in s for x in ("No such target id","WebSocketBadStatusException","socket is already closed","Connection to remote host was lost"))
+
+async def reconnect_current_page(ws=None,c=None,port=None):
+    """Close a stale renderer socket and attach once to the current target."""
+    try:
+        if ws: ws.close()
+    except Exception: pass
+    for _ in range(3):
+        t=page_target(port)
+        if t and t.get("webSocketDebuggerUrl"):
+            try:
+                nws=websocket.create_connection(t["webSocketDebuggerUrl"],timeout=15)
+                return nws,CDP(nws),t
+            except Exception:
+                await asyncio.sleep(.25)
+    raise TimeoutError("CDP current renderer unavailable")
+
 async def attach(t,ws):
     if ws:
         try: ws.close()
@@ -831,27 +853,39 @@ async def login_and_find(c,ws,key,cfg):
             await asyncio.sleep(.25)
     # If the first gate already saw #/home, keep the same renderer and proceed
     # directly to the business-page gate instead of polling for a login route.
-    if "#/home" in str(state.get("url",'')) and any(x in str(state.get("body",'')) for x in ("我的云电脑","已分配云电脑","云电脑")) and "暂无任何匹配结果" not in str(state.get("body",'')) and any(x in str(state.get("body",'')) for x in ("连接","运行中","正常","已关机","家庭云电脑","个人云电脑")):
-        return c,ws,state
-    # #/home is only a route shell. Wait for the actual cloud-card request to
-    # finish; "暂无任何匹配结果" is not an actionable card and must not enter
-    # SDK/click fallback.
-    if "#/home" in str(state.get("url",'')):
+    def is_business_home(s):
+        u=str(s.get("url",'')); b=str(s.get("body",''))
+        return "#/home" in u and any(x in b for x in ("我的云电脑","已分配云电脑","云电脑","个人中心"))
+    if is_business_home(state):
+        body_now=str(state.get("body",''))
+        card_ready=("暂无任何匹配结果" not in body_now and any(x in body_now for x in ("家庭云电脑","个人云电脑","已关机","连接","运行中","正常","已连接")))
+        if card_ready:
+            return c,ws,state
+        # The authenticated #/home shell is already the business page. A
+        # delayed/empty cloud-card response must not be misreported as a
+        # privacy/login-route failure; downstream SDK/card polling handles it.
         card_end=time.time()+45
         while time.time()<card_end:
-            state=capture_snapshot(c); body_now=str(state.get("body",''))
-            card_ready=("暂无任何匹配结果" not in body_now and any(x in body_now for x in ("家庭云电脑","个人云电脑","已关机","连接","运行中","正常","已连接")))
-            event(key,"cloud_list_probe",stage="等待云电脑卡片加载",ready=card_ready,detail=body_now[:320],page_snapshot=state)
-            if card_ready: break
+            try:
+                state=capture_snapshot(c); body_now=str(state.get("body",''))
+                card_ready=("暂无任何匹配结果" not in body_now and any(x in body_now for x in ("家庭云电脑","个人云电脑","已关机","连接","运行中","正常","已连接")))
+                event(key,"cloud_list_probe",stage="等待云电脑卡片加载",ready=card_ready,detail=body_now[:320],page_snapshot=state)
+                if card_ready: break
+            except Exception as e:
+                # Renderer replacement is expected during Electron navigation.
+                try:
+                    nt=page_target();
+                    if nt and nt.get("webSocketDebuggerUrl"):
+                        try: ws.close()
+                        except Exception: pass
+                        ws=websocket.create_connection(nt["webSocketDebuggerUrl"],timeout=15); c=CDP(ws)
+                except Exception: pass
             await asyncio.sleep(1)
+        state_url=str(state.get("url",'')); state_body=str(state.get("body",''))
+        if is_business_home(state):
+            event(key,"login_success",stage="已进入云电脑业务页，跳过登录表单",url=state_url,cloud_list_loaded=("暂无任何匹配结果" not in state_body),main_api=bool(c.eval("!!(window.mainApi&&window.mainApi.connectWorker)")))
+            return c,ws,state
     state_url=str(state.get("url",'')); state_body=str(state.get("body",''))
-    on_home=("#/home" in state_url and any(x in state_body for x in ("我的云电脑","已分配云电脑","云电脑")) and "暂无任何匹配结果" not in state_body and any(x in state_body for x in ("连接","运行中","正常","已关机","家庭云电脑","个人云电脑")))
-    if on_home:
-        # Privacy acceptance can land directly on the already authenticated
-        # cloud list. This is a successful login/business-page gate, not a
-        # navigation timeout and must skip the password-login flow.
-        event(key,"login_success",stage="已进入云电脑列表，跳过登录表单",url=state_url,cloud_list_loaded=True,main_api=bool(c.eval("!!(window.mainApi&&window.mainApi.connectWorker)")))
-        return c,ws,state
     if "#/login" not in state_url and "账密登录" not in state_body and "子账号登录" not in state_body:
         event(key,"privacy_navigation_timeout",stage="隐私确认后未进入登录页",detail=str(state)[:500],page_snapshot=state)
         try:
@@ -924,7 +958,11 @@ async def login_and_find(c,ws,key,cfg):
                 last="登录页仍未离开，可能登录提交未生效或业务页尚未加载"
                 if "验证码" in body or "错误" in body or "失败" in body:
                     last="登录页出现验证码/错误提示，需要人工确认"
-        except Exception: pass
+        except Exception as e:
+            if cdp_target_error(e):
+                try:
+                    ws,c,_=await reconnect_current_page(ws,c)
+                except Exception: pass
         event(key,"waiting_login",stage="等待业务页",detail=last[:240],page_snapshot=info if isinstance(info,dict) else {"body":last})
         await screenshot_page(key,c,"等待业务页")
     raise RuntimeError("login/cloud list not confirmed; 未确认业务页")

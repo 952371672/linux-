@@ -71,9 +71,8 @@ def _load_runtime_config():
     except Exception:return {"probe_interval":10,"fallback_concurrency":6}
 _runtime_config=_load_runtime_config()
 PROBE_INTERVAL=_runtime_config["probe_interval"]
-FALLBACK_CONCURRENCY=_runtime_config["fallback_concurrency"]
-# Eight slot identities retain stable DISPLAY/CDP/VNC numbers, but the heavy
-# display processes are created only when a slot is acquired.
+FALLBACK_CONCURRENCY=min(6,_runtime_config["fallback_concurrency"])
+# Fixed six-slot compatibility mode matching the earlier release.
 CLIENT_SLOTS=(
     {"name":"slot0","display":":100","port":9223},
     {"name":"slot1","display":":101","port":9224},
@@ -81,8 +80,6 @@ CLIENT_SLOTS=(
     {"name":"slot3","display":":103","port":9226},
     {"name":"slot4","display":":104","port":9227},
     {"name":"slot5","display":":105","port":9228},
-    {"name":"slot6","display":":106","port":9229},
-    {"name":"slot7","display":":107","port":9230},
 )
 class DynamicSlotLimiter:
     def __init__(self, limit):
@@ -106,49 +103,12 @@ current_slot=contextvars.ContextVar("cmcc_current_slot",default=CLIENT_SLOTS[0])
 slot_runtime:dict[str,dict[str,Any]]={}
 
 def create_slot_runtime(slot):
-    """Create display/VNC only while a heavy client owns this slot."""
-    name=slot["name"]; display=slot["display"]; vnc=5901+int(name[4:])
-    if name in slot_runtime:return
-    display_num=display.lstrip(":")
-    try:
-        lock=Path(f"/tmp/.X{display_num}-lock")
-        owner=int(lock.read_text().strip()) if lock.exists() else 0
-        if not owner or not Path(f"/proc/{owner}").exists():
-            lock.unlink(missing_ok=True); Path(f"/tmp/.X11-unix/X{display_num}").unlink(missing_ok=True)
-    except Exception: pass
-    env=os.environ.copy(); env["DISPLAY"]=display
-    log_base=ROOT/("slot-"+name)
-    xvfb_log=open(str(log_base)+"-xvfb.log","a",buffering=1)
-    xvfb=subprocess.Popen(["Xvfb",display,"-screen","0","1280x800x24","-ac","+extension","GLX","+render","-noreset"],env=env,stdout=xvfb_log,stderr=subprocess.STDOUT,start_new_session=True)
-    try:
-        ready=False
-        for _ in range(30):
-            try:
-                subprocess.run(["xdpyinfo","-display",display],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=1,check=True); ready=True; break
-            except Exception: time.sleep(.2)
-        if not ready: raise RuntimeError(f"Xvfb未就绪：{display}")
-        vnc_log=open(str(log_base)+"-vnc.log","a",buffering=1)
-        vnc_proc=subprocess.Popen(["x11vnc","-display",display,"-forever","-shared","-nopw","-noxdamage","-repeat","-rfbport",str(vnc)],env=env,stdout=vnc_log,stderr=subprocess.STDOUT,start_new_session=True)
-        slot_runtime[name]={"xvfb":xvfb,"xvfb_log":xvfb_log,"vnc":vnc_proc,"vnc_log":vnc_log}
-    except Exception:
-        try: os.killpg(xvfb.pid,9)
-        except Exception: pass
-        xvfb_log.close()
-        raise
+    """Fixed-slot compatibility: display servers are started by entrypoint."""
+    return
 
 def destroy_slot_runtime(slot):
-    r=slot_runtime.pop(slot["name"],None)
-    if not r:return
-    for key in ("vnc","xvfb"):
-        p=r.get(key)
-        if p:
-            try: os.killpg(p.pid,15); p.wait(timeout=3)
-            except Exception:
-                try: os.killpg(p.pid,9)
-                except Exception: pass
-    for key in ("vnc_log","xvfb_log"):
-        try:r[key].close()
-        except Exception:pass
+    # Fixed display servers remain resident across account runs.
+    return
 
 class AccountIn(BaseModel):
     username:str=Field(min_length=1,max_length=200); password:str=Field(min_length=1,max_length=300)

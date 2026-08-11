@@ -7,6 +7,7 @@ chown -R cmcc:cmcc /data
 for n in 0 1 2 3 4 5; do
   display=$((100+n)); vnc=$((5901+n))
   Xvfb ":$display" -screen 0 1280x800x24 -ac +extension GLX +render -noreset >"$HOME/xvfb-$n.log" 2>&1 &
+  for i in $(seq 1 20); do xdpyinfo -display ":$display" >/dev/null 2>&1 && break; sleep .2; done
   x11vnc -display ":$display" -forever -shared -nopw -noxdamage -repeat -rfbport "$vnc" >"$HOME/x11vnc-$n.log" 2>&1 &
 done
 cat > /data/vnc.tokens <<'EOF'

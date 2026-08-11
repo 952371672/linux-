@@ -58,6 +58,10 @@ app.mount("/webui", StaticFiles(directory="/opt/cmcc-app/webui", html=True), nam
 tasks:dict[str,asyncio.Task]={}
 stopped_accounts:set[str]=set()
 states:dict[str,dict[str,Any]]={}; account_locks:dict[str,asyncio.Lock]={}; scheduler_task=None
+# Cross-entrypoint single-flight guard. The per-worker lock prevents duplicate
+# rounds inside one worker; this set also covers manual/realtime workers that
+# overlap while an old task is being cancelled.
+active_run_keys:set[str]=set()
 active_clients:dict[str,tuple[Any,Any]]={}
 probe_last:dict[str,tuple[str,float]]={}
 probe_initialized:set[str]=set()
@@ -263,12 +267,21 @@ def probe_account(key,cfg):
             probe_initialized.add(key)
             if init and init[-1] != '2000':
                 return {'class':'unknown','reason':'postInit collectInfo='+','.join(init)}
-        a=_probe_request('/terminal/cc/cloudPc/list/v6',tok,{'pageNum':1}); b=_probe_request('/terminal/cc/cloudPc/sublist/v3',tok,{'pageNum':1})
+        # list and sublist are independent status reads. Run them in parallel so
+        # slow response from one account route does not add a second full RTT to
+        # every probe round. Each request builds its own nonce/signature.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fa=pool.submit(_probe_request,'/terminal/cc/cloudPc/list/v6',tok,{'pageNum':1})
+            fb=pool.submit(_probe_request,'/terminal/cc/cloudPc/sublist/v3',tok,{'pageNum':1})
+            a=fa.result(); b=fb.result()
         if any(isinstance(z,dict) and z.get('code')==4015 for z in (a,b)):
             ok,reason=_refresh_probe_login(key,cfg,tok)
             if not ok:return {'class':'unknown','reason':'4015刷新登录失败：'+reason}
             tok=_probe_tokens(PROFILES/key)
-            a=_probe_request('/terminal/cc/cloudPc/list/v6',tok,{'pageNum':1}); b=_probe_request('/terminal/cc/cloudPc/sublist/v3',tok,{'pageNum':1})
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fa=pool.submit(_probe_request,'/terminal/cc/cloudPc/list/v6',tok,{'pageNum':1})
+                fb=pool.submit(_probe_request,'/terminal/cc/cloudPc/sublist/v3',tok,{'pageNum':1})
+                a=fa.result(); b=fb.result()
         items=[]
         for z in (a,b):
             if not isinstance(z,dict) or z.get('code') != 2000: continue
@@ -291,7 +304,7 @@ def probe_account(key,cfg):
             else: cls='unknown'
             classes.append(cls); details.append(f"{x.get('userServiceId') or x.get('vmId') or 'unknown'}:{vals}")
         cls='need' if 'need' in classes else ('suspect' if 'suspect' in classes else ('unknown' if 'unknown' in classes else 'maybe_skip'))
-        return {'class':cls,'reason':'; '.join(details[:5]),'vmStatus':items[0].get('vmStatus'),'items':len(items)}
+        return {'class':cls,'reason':'; '.join(details[:5]),'vmStatus':items[0].get('vmStatus'),'items':len(items),'strong_shutdown':bool(any(x.get('vmStatus') in (23,'23') for x in items) and any(x.get(k) not in (None,1,'1') for x in items for k in ('serviceStatus','powerStatus','onlineStatus','connectStatus')))}
     except Exception as e:return {'class':'unknown','reason':f'{type(e).__name__}: {str(e)[:160]}'}
 def http_json(url):
     with urllib.request.urlopen(url,timeout=5) as r:return json.loads(r.read())
@@ -1060,6 +1073,18 @@ async def click_fallback(key,c,ws,cfg):
     except Exception: pass
     raise RuntimeError("点击后状态未恢复：未观察到稳定运行中状态；最后卡片状态="+before_card[:220]+"；最后页面="+last[:320])
 async def run_once(key,cfg):
+    # Single-flight across probe, realtime and manual entrypoints. A duplicate
+    # trigger must not start another Electron/profile/CDP recovery in parallel.
+    if key in active_run_keys:
+        event(key,"run_coalesced",stage="账号已有保活任务运行，合并重复触发",reason="single_flight")
+        return False
+    active_run_keys.add(key)
+    try:
+        return await _run_once_slot(key,cfg)
+    finally:
+        active_run_keys.discard(key)
+
+async def _run_once_slot(key,cfg):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.
     async with fallback_slots:
         slot=await slot_pool.get(); token=current_slot.set(slot)
@@ -1070,6 +1095,16 @@ async def run_once(key,cfg):
             raise
         fallback_active.add(key); account_slots[key]=slot; event(key,"fallback_slot_acquired",stage=f"已取得兜底保活槽位 {slot['name']}（并发上限{fallback_slots.limit}）",active=list(fallback_active),limit=fallback_slots.limit,display=slot["display"],cdp_port=slot["port"],vnc_token=slot["name"])
         try:
+            # A recovery request may wait behind another heavy account. Recheck
+            # the cloud state after slot acquisition so a recovered account does
+            # not launch Electron unnecessarily.
+            try:
+                preflight=await asyncio.to_thread(probe_account,key,cfg)
+                if preflight.get("class")=="maybe_skip":
+                    event(key,"recovery_preflight_normal",stage="取得槽位后复核已恢复，跳过客户端启动",method="api_probe",evidence="槽位等待期间云电脑已恢复",vmStatus=preflight.get("vmStatus"),detail=preflight.get("reason",""),keepalive_confirmed=True)
+                    return True
+            except Exception as pe:
+                event(key,"recovery_preflight_error",stage="取得槽位后复核失败，继续SDK/客户端恢复",reason=f"{type(pe).__name__}: {str(pe)[:180]}")
             return await _run_once_heavy(key,cfg,slot)
         finally:
             stop_active_client(key)
@@ -1140,6 +1175,9 @@ async def _run_once_heavy(key,cfg,slot):
 async def worker(key):
     lock=account_locks.setdefault(key,asyncio.Lock())
     reap_children()
+    # Fixed-deadline cadence: request time no longer adds drift to the next
+    # probe. The configured interval itself remains unchanged.
+    next_probe=time.monotonic()
     async with lock:
         while True:
             if key in stopped_accounts:return
@@ -1153,9 +1191,32 @@ async def worker(key):
                 event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
                 if cls=="maybe_skip":
                     event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
-                elif cls in ("suspect","need") and count>=PROBE_CONSECUTIVE:
-                    event(key,"probe_trigger",stage="接口探针确认云电脑疑似关机，触发SDK/点击保活",trigger_class=cls,probe_count=count,detail=result.get("reason",""))
-                    await run_once(key,cfg)
+                elif cls in ("suspect","need") and count==1:
+                    # Fast confirmation only after the first suspect/need result.
+                    # Regular healthy cadence stays unchanged; the extra check
+                    # prevents waiting a full 10 seconds to confirm a real drop.
+                    await asyncio.sleep(1)
+                    confirm=await asyncio.to_thread(probe_account,key,cfg)
+                    ccls=str(confirm.get("class","unknown")); probe_last[key]=(ccls,2 if ccls==cls else 1)
+                    event(key,"probe_fast_confirm",stage="首次异常后1秒快速复核",probe_class=ccls,probe_count=2 if ccls==cls else 1,vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""))
+                    if ccls in ("suspect","need"):
+                        event(key,"probe_trigger",stage="快速复核仍异常，触发SDK/点击保活",trigger_class=ccls,probe_count=2,trigger_policy="fast_confirm_1s",detail=confirm.get("reason",""))
+                        await run_once(key,cfg)
+                        probe_last[key]=(None,0)
+                    elif ccls=="maybe_skip":
+                        event(key,"probe_normal",stage="快速复核确认云电脑正常，跳过客户端保活",method="api_probe",evidence="异常后的快速复核",vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""))
+                elif cls in ("suspect","need") and (result.get("strong_shutdown") or count>=PROBE_CONSECUTIVE):
+                    fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"
+                    event(key,"probe_trigger",stage="接口探针确认云电脑疑似关机，触发SDK/点击保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
+                    ok=await run_once(key,cfg)
+                    # Verify immediately after a recovery attempt instead of
+                    # waiting for the next periodic round.
+                    if ok is not False:
+                        try:
+                            verify=await asyncio.to_thread(probe_account,key,cfg)
+                            event(key,"post_recovery_probe",stage="保活动作后立即复核协议状态",probe_class=verify.get("class"),vmStatus=verify.get("vmStatus"),detail=verify.get("reason",""),keepalive_confirmed=verify.get("class")=="maybe_skip")
+                        except Exception as ve:
+                            event(key,"post_recovery_probe_error",stage="保活后协议复核失败，交由下一轮探针继续观察",reason=f"{type(ve).__name__}: {str(ve)[:180]}")
                     probe_last[key]=(None,0)
                 elif cls=="unknown" and count>=PROBE_CONSECUTIVE and result.get("reason")!="缺少SohoToken":
                     event(key,"probe_unknown",stage="接口探针连续未知，触发一次客户端兜底",probe_count=count,detail=result.get("reason",""))
@@ -1168,7 +1229,9 @@ async def worker(key):
                 if key in stopped_accounts:return
                 event(key,"error",stage="本轮失败",reason=f"{type(e).__name__}: {str(e)[:240]}")
             if key in stopped_accounts:return
-            await asyncio.sleep(PROBE_INTERVAL)
+            next_probe+=PROBE_INTERVAL
+            await asyncio.sleep(max(0.0,next_probe-time.monotonic()))
+
 async def probe_scheduler():
     event("_scheduler","scheduler",stage=f"实时探针运行中：每{PROBE_INTERVAL}秒扫描，协议探针正常跳过，SDK失败后点击兜底")
     while True:

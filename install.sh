@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 APP_DIR="${APP_DIR:-/opt/cmcc-linux-docker}"
 PORT="${CMCC_PORT:-8080}"
-CNB_IMAGE="${CNB_IMAGE:-docker.cnb.cool/952371672/cmcc-linux-docker:stable-latest}"
 ASSET="CMCC.Docker.zip"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 [[ "$(id -u)" == 0 ]] || { echo '请使用 root 或 sudo 运行'; exit 1; }
@@ -53,31 +52,9 @@ ARCHIVE="$TMP/$ASSET"
 if [[ -n "$FOUND" && -f "$FOUND" ]]; then
   echo "使用本地安装包：$(readlink -f "$FOUND")"; cp -f "$FOUND" "$ARCHIVE"
 else
-  echo '从 CNB 公开制品获取安装包（无需登录和Token）'
-  REGISTRY="https://${CNB_IMAGE%%/*}"
-  REF="${CNB_IMAGE#*/}"; TAG="${REF##*:}"; REPO="${REF%:*}"
-  TOKEN_URL="$REGISTRY/service/token?service=cnb-registry&scope=repository:${REPO}:pull"
-  curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 "$TOKEN_URL" -o "$TMP/token.json"
-  AUTH_VALUE="$(python3 - "$TMP/token.json" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1],encoding='utf8'))
-print(p.get('token') or p.get('access_token') or '')
-PY
-)"
-  [[ -n "$AUTH_VALUE" ]] || { echo 'CNB匿名制品Token获取失败'; exit 1; }
-  printf 'Authorization: Bearer %s\n' "$AUTH_VALUE" > "$TMP/auth.header"
-  curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 -H "@${TMP}/auth.header" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "$REGISTRY/v2/$REPO/manifests/$TAG" -o "$TMP/manifest.json"
-  LAYER="$(python3 - "$TMP/manifest.json" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1],encoding='utf8'))
-for x in p.get('layers',[]):
- if x.get('annotations',{}).get('org.opencontainers.image.title')=='CMCC.Docker.zip' or x.get('mediaType')=='application/zip':
-  print(x['digest']); break
-else: raise SystemExit('CNB制品中找不到 CMCC.Docker.zip 层')
-PY
-)"
-  [[ "$LAYER" == sha256:* ]] || exit 1
-  curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -H "@${TMP}/auth.header" -o "$ARCHIVE" "$REGISTRY/v2/$REPO/blobs/$LAYER"
+  echo '从 GitHub Release 获取安装包（仅访问 GitHub）'
+  curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 1800 --progress-bar --show-error \
+    'https://github.com/952371672/linux-/releases/download/stable-latest/CMCC.Docker.zip' -o "$ARCHIVE"
 fi
 [[ -s "$ARCHIVE" ]] || { echo '安装包为空'; exit 1; }
 unzip -tq "$ARCHIVE"
@@ -100,4 +77,4 @@ cd "$APP_DIR"; docker compose -f novnc-compose.yml config >/dev/null
 docker compose -f novnc-compose.yml build
 docker compose -f novnc-compose.yml up -d
 sleep 5; docker compose -f novnc-compose.yml ps
-echo 'CNB安装完成（公开制品，无需Token）'
+echo 'GitHub安装完成（仅访问GitHub）'

@@ -29,7 +29,8 @@ if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! 
 fi
 if ! command -v docker >/dev/null 2>&1; then
   echo '未检测到 Docker，正在通过 Docker 官方安装脚本安装...'
-  curl --http1.1 -fsSL --retry 5 --retry-all-errors https://get.docker.com | sh
+  curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 https://get.docker.com -o "$TMP/get-docker.sh"
+  bash "$TMP/get-docker.sh"
   systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true
 fi
 if ! command -v docker >/dev/null 2>&1; then echo 'Docker 安装失败'; exit 1; fi

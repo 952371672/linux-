@@ -27,7 +27,7 @@ if os.environ.get("CMCC_SECRET"):
 else:
     if not SECRET.exists(): SECRET.write_bytes(Fernet.generate_key()); SECRET.chmod(0o600)
     _fernet=Fernet(SECRET.read_bytes())
-APP_VERSION="1.4.1-observe"
+APP_VERSION="1.5.0-dynamic-test"
 app=FastAPI(title=f"CMCC Linux v127 Keepalive {APP_VERSION}",version=APP_VERSION)
 WEBUI_USER=os.environ.get("CMCC_WEBUI_USER","").strip()
 WEBUI_PASSWORD=os.environ.get("CMCC_WEBUI_PASSWORD","")
@@ -87,7 +87,17 @@ def _save_probe_observation():
 recovery_cooldown_until:dict[str,float]={}
 recovery_failure_streak:dict[str,int]={}
 RECOVERY_FAILURE_COOLDOWN=60.0
-PROBE_INTERVAL=10; PROBE_CONSECUTIVE=2
+# Per-account cadence: after recovery, wait 10s for the first check; once the
+# account is stable for one minute, use 30s until the long-online risk window.
+# No global probe semaphore: each account worker is single-flight and sleeps
+# independently, so accounts are not forced into one shared probe batch.
+PROBE_RECOVERY_FIRST=10.0
+PROBE_CONSECUTIVE=2
+PROBE_STABLE_INTERVAL=30.0
+PROBE_LONG_ONLINE_INTERVAL=5.0
+PROBE_STABLE_AFTER=60.0
+PROBE_LONG_ONLINE_AFTER=15*60.0
+PROBE_JITTER_RATIO=0.10
 RUNTIME_CONFIG=ROOT/"runtime-config.json"
 CONFIG_LOCK=threading.Lock()
 def _load_runtime_config():
@@ -173,7 +183,20 @@ def _append_event_line(line):
         _events_size_check += 1
 
 def event(key,status,**extra):
-    x={"time":time.strftime("%Y-%m-%d %H:%M:%S"),"account":key,"status":status,**extra}; states[key]=x
+    previous=states.get(key) or {}
+    x={"time":time.strftime("%Y-%m-%d %H:%M:%S"),"account":key,"status":status,**extra}
+    # Preserve the latest terminal result while probe/stage events continue to
+    # refresh the live row. This keeps WebUI counters mutually consistent.
+    if previous.get("outcome") and "outcome" not in x: x["outcome"]=previous["outcome"]
+    if status=="success":
+        method=str(extra.get("method") or "")
+        reason=str(extra.get("reason") or "")
+        x["outcome"]=("sdk_success" if method=="sdk_connectWorker" or reason=="sdk_connectWorker" else
+                       "click_fallback_success" if method=="client_click_fallback" or reason in ("state_changed_and_recovered","confirmed_normal_twice") else
+                       "normal_success")
+    elif status in ("error","recovery_failed"):
+        x["outcome"]="failed"
+    states[key]=x
     # Keep a redacted, bounded page snapshot for WebUI diagnostics. Never store
     # input values, passwords, tokens, cookies, or full HTML.
     if "page_snapshot" in x:
@@ -1213,6 +1236,23 @@ async def _run_once_heavy(key,cfg,slot):
         kill_profile_clients(str(profile))
         clear_stale_profile_locks(str(profile))
         reap_children()
+def _account_probe_interval(key):
+    obs=probe_observation.get(key,{})
+    now=time.time()
+    last_recovery=float(obs.get("last_recovery_at") or 0)
+    if last_recovery:
+        since_recovery=now-last_recovery
+        if since_recovery < PROBE_RECOVERY_FIRST:
+            return PROBE_RECOVERY_FIRST,"recovery_first_10s"
+    online=float(obs.get("online_since") or 0)
+    if online:
+        age=now-online
+        if age >= PROBE_LONG_ONLINE_AFTER:
+            return PROBE_LONG_ONLINE_INTERVAL,"long_online_risk_15m_plus"
+        if age >= PROBE_STABLE_AFTER:
+            return PROBE_STABLE_INTERVAL,"stable_after_1m"
+    return PROBE_RECOVERY_FIRST,"baseline_10s"
+
 async def worker(key):
     lock=account_locks.setdefault(key,asyncio.Lock())
     reap_children()
@@ -1238,38 +1278,19 @@ async def worker(key):
                     obs[f"{cls}_count"]=int(obs.get(f"{cls}_count",0))+1
                 _save_probe_observation()
                 count=count+1 if cls==previous else 1; probe_last[key]=(cls,count)
-                event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""),online_since=obs.get("online_since"),online_seconds=round(now-float(obs["online_since"])) if obs.get("online_since") else 0,observation_only=True)
+                interval,interval_policy=_account_probe_interval(key)
+                event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""),online_since=obs.get("online_since"),online_seconds=round(now-float(obs["online_since"])) if obs.get("online_since") else 0,probe_interval_seconds=interval,probe_interval_policy=interval_policy,observation_only=True)
                 if cls=="maybe_skip":
                     event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
-                elif cls in ("suspect","need") and count==1:
-                    # Fast confirmation only after the first suspect/need result.
-                    # Regular healthy cadence stays unchanged; the extra check
-                    # prevents waiting a full 10 seconds to confirm a real drop.
-                    await asyncio.sleep(1)
-                    confirm=await asyncio.to_thread(probe_account,key,cfg)
-                    ccls=str(confirm.get("class","unknown")); probe_last[key]=(ccls,2 if ccls==cls else 1)
-                    event(key,"probe_fast_confirm",stage="首次异常后1秒快速复核",probe_class=ccls,probe_count=2 if ccls==cls else 1,vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""))
-                    if ccls in ("suspect","need"):
-                        event(key,"probe_trigger",stage="快速复核仍异常，触发SDK/点击保活",trigger_class=ccls,probe_count=2,trigger_policy="fast_confirm_1s",detail=confirm.get("reason",""))
-                        await run_once(key,cfg)
+                elif cls in ("suspect","need"):
+                    if count>=PROBE_CONSECUTIVE:
+                        fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"
+                        event(key,"probe_trigger",stage="接口探针连续确认异常，触发SDK/点击保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
+                        ok=await run_once(key,cfg)
+                        obs=probe_observation.setdefault(key,{})
+                        obs["recovery_count"]=int(obs.get("recovery_count",0))+1; obs["last_recovery_at"]=time.time(); _save_probe_observation()
                         probe_last[key]=(None,0)
-                    elif ccls=="maybe_skip":
-                        event(key,"probe_normal",stage="快速复核确认云电脑正常，跳过客户端保活",method="api_probe",evidence="异常后的快速复核",vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""))
-                elif cls in ("suspect","need") and (result.get("strong_shutdown") or count>=PROBE_CONSECUTIVE):
-                    fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"
-                    event(key,"probe_trigger",stage="接口探针确认云电脑疑似关机，触发SDK/点击保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
-                    ok=await run_once(key,cfg)
-                    obs=probe_observation.setdefault(key,{})
-                    obs["recovery_count"]=int(obs.get("recovery_count",0))+1; obs["last_recovery_at"]=time.time(); _save_probe_observation()
-                    # Verify immediately after a recovery attempt instead of
-                    # waiting for the next periodic round.
-                    if ok is not False:
-                        try:
-                            verify=await asyncio.to_thread(probe_account,key,cfg)
-                            event(key,"post_recovery_probe",stage="保活动作后立即复核协议状态",probe_class=verify.get("class"),vmStatus=verify.get("vmStatus"),detail=verify.get("reason",""),keepalive_confirmed=verify.get("class")=="maybe_skip")
-                        except Exception as ve:
-                            event(key,"post_recovery_probe_error",stage="保活后协议复核失败，交由下一轮探针继续观察",reason=f"{type(ve).__name__}: {str(ve)[:180]}")
-                    probe_last[key]=(None,0)
+
                 elif cls=="unknown" and count>=PROBE_CONSECUTIVE and result.get("reason")!="缺少SohoToken":
                     event(key,"probe_unknown",stage="接口探针连续未知，触发一次客户端兜底",probe_count=count,detail=result.get("reason",""))
                     await run_once(key,cfg); probe_last[key]=(None,0)
@@ -1281,7 +1302,9 @@ async def worker(key):
                 if key in stopped_accounts:return
                 event(key,"error",stage="本轮失败",reason=f"{type(e).__name__}: {str(e)[:240]}")
             if key in stopped_accounts:return
-            next_probe+=PROBE_INTERVAL
+            interval,_policy=_account_probe_interval(key)
+            jitter=interval*PROBE_JITTER_RATIO
+            next_probe+=max(1.0,interval+random.uniform(-jitter,jitter))
             await asyncio.sleep(max(0.0,next_probe-time.monotonic()))
 
 async def probe_scheduler():

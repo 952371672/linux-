@@ -27,7 +27,8 @@ if os.environ.get("CMCC_SECRET"):
 else:
     if not SECRET.exists(): SECRET.write_bytes(Fernet.generate_key()); SECRET.chmod(0o600)
     _fernet=Fernet(SECRET.read_bytes())
-app=FastAPI(title="CMCC Linux v127 Keepalive",version="1.4.0")
+APP_VERSION="1.4.1-observe"
+app=FastAPI(title=f"CMCC Linux v127 Keepalive {APP_VERSION}",version=APP_VERSION)
 WEBUI_USER=os.environ.get("CMCC_WEBUI_USER","").strip()
 WEBUI_PASSWORD=os.environ.get("CMCC_WEBUI_PASSWORD","")
 WEBUI_REALM=os.environ.get("CMCC_WEBUI_REALM","CMCC Keepalive")
@@ -65,6 +66,21 @@ active_run_keys:set[str]=set()
 active_clients:dict[str,tuple[Any,Any]]={}
 probe_last:dict[str,tuple[str,float]]={}
 probe_initialized:set[str]=set()
+# Observation-only telemetry: persisted per-account online/probe history.
+# This release deliberately keeps the effective probe cadence unchanged at 10s.
+PROBE_OBSERVATION=ROOT/"probe-observation.json"
+probe_observation:dict[str,dict[str,Any]]={}
+def _load_probe_observation():
+    global probe_observation
+    try:
+        x=json.loads(PROBE_OBSERVATION.read_text("utf-8"))
+        probe_observation=x if isinstance(x,dict) else {}
+    except Exception: probe_observation={}
+_load_probe_observation()
+def _save_probe_observation():
+    tmp=Path(str(PROBE_OBSERVATION)+".tmp")
+    tmp.write_text(json.dumps(probe_observation,ensure_ascii=False,indent=2),"utf-8")
+    tmp.replace(PROBE_OBSERVATION)
 # Keep all six fixed recovery slots for simultaneous real outages.  Cooldown is
 # account-scoped and only prevents an account that just failed recovery from
 # immediately monopolising a slot again.
@@ -1211,9 +1227,18 @@ async def worker(key):
             try:
                 reap_children()
                 result=await asyncio.to_thread(probe_account,key,cfg)
-                cls=str(result.get("class","unknown")); previous,count=probe_last.get(key,(None,0))
+                now=time.time(); cls=str(result.get("class","unknown")); previous,count=probe_last.get(key,(None,0))
+                obs=probe_observation.setdefault(key,{"online_since":None,"last_probe_at":None,"last_class":None,"normal_probe_count":0,"suspect_count":0,"unknown_count":0,"need_count":0,"recovery_count":0,"last_recovery_at":None})
+                obs["last_probe_at"]=now; obs["last_class"]=cls
+                if cls=="maybe_skip":
+                    if not obs.get("online_since"): obs["online_since"]=now
+                    obs["normal_probe_count"]=int(obs.get("normal_probe_count",0))+1
+                else:
+                    obs["online_since"]=None
+                    obs[f"{cls}_count"]=int(obs.get(f"{cls}_count",0))+1
+                _save_probe_observation()
                 count=count+1 if cls==previous else 1; probe_last[key]=(cls,count)
-                event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
+                event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""),online_since=obs.get("online_since"),online_seconds=round(now-float(obs["online_since"])) if obs.get("online_since") else 0,observation_only=True)
                 if cls=="maybe_skip":
                     event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
                 elif cls in ("suspect","need") and count==1:
@@ -1234,6 +1259,8 @@ async def worker(key):
                     fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"
                     event(key,"probe_trigger",stage="接口探针确认云电脑疑似关机，触发SDK/点击保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
                     ok=await run_once(key,cfg)
+                    obs=probe_observation.setdefault(key,{})
+                    obs["recovery_count"]=int(obs.get("recovery_count",0))+1; obs["last_recovery_at"]=time.time(); _save_probe_observation()
                     # Verify immediately after a recovery attempt instead of
                     # waiting for the next periodic round.
                     if ok is not False:
@@ -1296,6 +1323,12 @@ def live_page(key):
     if key not in read_accounts(): raise HTTPException(404,"account not found")
     return FileResponse("/opt/cmcc-app/webui/live.html",media_type="text/html",headers={"Cache-Control":"no-store"})
 
+@app.get("/probe-observation")
+def probe_observation_view():
+    now=time.time(); out={}
+    for k,v in probe_observation.items():
+        x=dict(v); x["online_seconds"]=round(now-float(x["online_since"])) if x.get("online_since") else 0; out[k]=x
+    return {"probe_interval":PROBE_INTERVAL,"observation_only":True,"accounts":out}
 @app.get("/runtime-config")
 def runtime_config():
     return {"probe_interval":PROBE_INTERVAL,"fallback_concurrency":fallback_slots.limit,"active_slots":len(fallback_active),"max_slots":len(CLIENT_SLOTS)}
@@ -1314,7 +1347,7 @@ def update_runtime_config(x:RuntimeConfigIn):
     return runtime_config()
 
 @app.get("/health")
-def health():return {"ok":True,"version":"1.4.0","accounts":len(read_accounts()),"running":[k for k,v in tasks.items() if not v.done()],"scheduler":"running" if scheduler_task and not scheduler_task.done() else "stopped","fallback_concurrency":fallback_slots.limit,"fallback_active":list(fallback_active),"client_slots":[{"name":s["name"],"display":s["display"],"cdp_port":s["port"]} for s in CLIENT_SLOTS]}
+def health():return {"ok":True,"version":APP_VERSION,"accounts":len(read_accounts()),"running":[k for k,v in tasks.items() if not v.done()],"scheduler":"running" if scheduler_task and not scheduler_task.done() else "stopped","fallback_concurrency":fallback_slots.limit,"fallback_active":list(fallback_active),"client_slots":[{"name":s["name"],"display":s["display"],"cdp_port":s["port"]} for s in CLIENT_SLOTS]}
 class PasswordChange(BaseModel):
     current_password:str=Field(min_length=1,max_length=300)
     new_password:str=Field(min_length=8,max_length=300)

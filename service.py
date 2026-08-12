@@ -65,6 +65,12 @@ active_run_keys:set[str]=set()
 active_clients:dict[str,tuple[Any,Any]]={}
 probe_last:dict[str,tuple[str,float]]={}
 probe_initialized:set[str]=set()
+# Keep all six fixed recovery slots for simultaneous real outages.  Cooldown is
+# account-scoped and only prevents an account that just failed recovery from
+# immediately monopolising a slot again.
+recovery_cooldown_until:dict[str,float]={}
+recovery_failure_streak:dict[str,int]={}
+RECOVERY_FAILURE_COOLDOWN=60.0
 PROBE_INTERVAL=10; PROBE_CONSECUTIVE=2
 RUNTIME_CONFIG=ROOT/"runtime-config.json"
 CONFIG_LOCK=threading.Lock()
@@ -1078,9 +1084,28 @@ async def run_once(key,cfg):
     if key in active_run_keys:
         event(key,"run_coalesced",stage="账号已有保活任务运行，合并重复触发",reason="single_flight")
         return False
+    now=time.monotonic(); until=recovery_cooldown_until.get(key,0.0)
+    if until>now:
+        remaining=max(1,int(until-now))
+        event(key,"recovery_cooldown",stage=f"该账号上次恢复失败，冷却{remaining}秒后再试",reason="failed_recovery_cooldown",cooldown_remaining=remaining)
+        return False
     active_run_keys.add(key)
     try:
-        return await _run_once_slot(key,cfg)
+        result=await _run_once_slot(key,cfg)
+        # The API-state shortcut returns None after it has emitted a verified
+        # success event; only an explicit False is an unconfirmed recovery.
+        if result is False:
+            raise RuntimeError("SDK/客户端恢复未确认成功")
+        recovery_failure_streak.pop(key,None); recovery_cooldown_until.pop(key,None)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        streak=recovery_failure_streak.get(key,0)+1; recovery_failure_streak[key]=streak
+        cooldown=min(300.0,RECOVERY_FAILURE_COOLDOWN*(2**min(streak-1,2)))
+        recovery_cooldown_until[key]=time.monotonic()+cooldown
+        event(key,"recovery_failed",stage=f"恢复未成功，{int(cooldown)}秒后允许下一次重试",reason=f"{type(e).__name__}: {str(e)[:220]}",failure_streak=streak,cooldown_seconds=int(cooldown))
+        return False
     finally:
         active_run_keys.discard(key)
 

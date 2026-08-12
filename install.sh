@@ -128,4 +128,6 @@ docker compose -f novnc-compose.yml build --progress=plain
 step 7 '启动服务并检查状态'
 docker compose -f novnc-compose.yml up -d
 sleep 5; docker compose -f novnc-compose.yml ps
-echo 'GitHub安装完成（仅访问GitHub）'
+WEBUI_USER="$(sed -n 's/^CMCC_WEBUI_USER=//p' "$APP_DIR/.env" | tail -n 1)"; WEBUI_PASSWORD="$(sed -n 's/^CMCC_WEBUI_PASSWORD=//p' "$APP_DIR/.env" | tail -n 1)"
+printf '\n========================================\nGitHub 安装完成\nWebUI 登录地址：http://服务器IP:%s/\nWebUI 用户名：%s\nWebUI 密码：%s\n========================================\n' "$PORT" "${WEBUI_USER:-admin}" "${WEBUI_PASSWORD:-admin}"
+echo '请首次登录后立即修改密码；以上凭据不会写入日志。'

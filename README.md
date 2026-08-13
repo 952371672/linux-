@@ -71,6 +71,50 @@ curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 
 
 GitHub 安装脚本只从 GitHub Release 下载 `stable-latest/CMCC.Docker.zip`，不会访问 CNB 或读取 CNB Token。
 
+### 已安装版本更新
+
+更新前请确认服务器上的账号、Token、profile 和 WebUI 密码都在 `/opt/cmcc-linux-docker/data/` 或 `.env` 中。更新脚本会保留 `data/`、`.env` 和 `data/webui-auth.json`，不会删除账号运行数据。
+
+```bash
+curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
+  https://raw.githubusercontent.com/952371672/linux-/main/update.sh -o /tmp/cmcc-update.sh
+sudo bash /tmp/cmcc-update.sh
+```
+
+也可以先下载完整包，再使用本地包更新（适合 GitHub 下载不稳定的服务器）：
+
+```bash
+scp CMCC.Docker.zip root@服务器IP:/tmp/CMCC.Docker.zip
+ssh root@服务器IP 'CMCC_LOCAL_ARCHIVE=/tmp/CMCC.Docker.zip bash -s' < update.sh
+```
+
+更新脚本会自动校验 ZIP、停止旧容器、保留 `data/` 和 `.env`、重建镜像并启动新版本。更新完成后检查：
+
+```bash
+cd /opt/cmcc-linux-docker
+docker compose -f novnc-compose.yml ps
+curl -u 'admin:你的WebUI密码' http://127.0.0.1:8080/health
+```
+
+### CNB 安装/更新
+
+CNB 使用独立的公开 OCI 制品渠道，不使用 GitHub 下载地址，也不需要填写 Token：
+
+```bash
+curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 1800 \
+  https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/install.sh | sudo bash
+```
+
+在已有 CNB 安装上重复执行同一命令即可更新。脚本会保留 `/opt/cmcc-linux-docker/data/`、`.env` 和 WebUI 持久化密码，然后重新构建并启动容器。
+
+如果服务器无法直接访问 CNB，可在能下载文件的电脑上下载 `CMCC.Docker.zip`，上传到服务器后执行：
+
+```bash
+sudo CMCC_LOCAL_ARCHIVE=/tmp/CMCC.Docker.zip bash install.sh
+```
+
+> GitHub 更新只使用 GitHub Release；CNB 安装/更新只使用 CNB OCI 制品。不要混用两个渠道的安装脚本。
+
 ## WebUI 首次登录密码（重要）
 
 全新安装的默认 WebUI 登录凭据固定为：

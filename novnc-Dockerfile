@@ -47,6 +47,8 @@ COPY service.py /opt/cmcc-app/service.py
 COPY webui /opt/cmcc-app/webui
 COPY novnc-entrypoint.sh /opt/cmcc-app/entrypoint.sh
 COPY fallback-start-client.sh /opt/cmcc-app/fallback-start-client.sh
+RUN sed -i 's/\r$//' /opt/cmcc-app/entrypoint.sh /opt/cmcc-app/fallback-start-client.sh \
+ && chmod +x /opt/cmcc-app/entrypoint.sh /opt/cmcc-app/fallback-start-client.sh
 RUN printf '%s\n' '<!doctype html><meta charset="utf-8"><title>CMCC noVNC</title><script>location.replace("vnc.html?autoconnect=true&resize=scale&path=websockify")</script>' > /usr/share/novnc/index.html \
  && chmod +x /opt/cmcc-app/entrypoint.sh /opt/cmcc-app/fallback-start-client.sh && chown -R cmcc:cmcc /opt/cmcc-app /home/cmcc /data
 WORKDIR /opt/cmcc-app

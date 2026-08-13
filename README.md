@@ -98,11 +98,13 @@ curl -u 'admin:你的WebUI密码' http://127.0.0.1:8080/health
 
 ### CNB 安装/更新
 
-CNB 使用独立的公开 OCI 制品渠道，不使用 GitHub 下载地址，也不需要填写 Token：
+CNB 使用独立的公开 OCI 制品渠道，不使用 GitHub 下载地址，也不需要填写 Token。CNB 网页的 `/-/raw/` 地址在未登录时可能返回 HTML 页面，不能直接管道给 `bash`，否则会出现 `curl: (23) Failure writing output to destination`。请先通过 Git 克隆脚本，再本地执行：
 
 ```bash
-curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 1800 \
-  https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/install.sh | sudo bash
+TMP_DIR="$(mktemp -d)"
+git clone --depth 1 https://cnb.cool/952371672/cmcc-linux-docker.git "$TMP_DIR/cmcc-linux-docker"
+sudo bash "$TMP_DIR/cmcc-linux-docker/install.sh"
+rm -rf "$TMP_DIR"
 ```
 
 在已有 CNB 安装上重复执行同一命令即可更新。脚本会保留 `/opt/cmcc-linux-docker/data/`、`.env` 和 WebUI 持久化密码，然后重新构建并启动容器。

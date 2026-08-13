@@ -87,6 +87,9 @@ def _save_probe_observation():
 recovery_cooldown_until:dict[str,float]={}
 recovery_failure_streak:dict[str,int]={}
 RECOVERY_FAILURE_COOLDOWN=60.0
+SUSPECT_FAST_CONFIRM_DELAY=1.0
+STARTING_OBSERVE_WINDOW=30.0
+STARTING_RETRY_COOLDOWN=30.0
 # Per-account cadence: after recovery, wait 10s for the first check; once the
 # account is stable for one minute, use 30s until the long-online risk window.
 # No global probe semaphore: each account worker is single-flight and sleeps
@@ -94,7 +97,7 @@ RECOVERY_FAILURE_COOLDOWN=60.0
 PROBE_RECOVERY_FIRST=10.0
 PROBE_CONSECUTIVE=2
 PROBE_STABLE_INTERVAL=30.0
-PROBE_LONG_ONLINE_INTERVAL=5.0
+PROBE_LONG_ONLINE_INTERVAL=10.0
 PROBE_STABLE_AFTER=60.0
 PROBE_LONG_ONLINE_AFTER=15*60.0
 PROBE_JITTER_RATIO=0.10
@@ -297,7 +300,19 @@ def _refresh_probe_login(key,cfg,tok):
     except Exception as e:return False,f'{type(e).__name__}: {str(e)[:120]}'
 def probe_account(key,cfg):
     tok=_probe_tokens(PROFILES/key)
-    if not tok or not tok.get('tokens'): return {'class':'unknown','reason':'缺少SohoToken'}
+    if not tok or not tok.get('tokens'):
+        # A missing browser-cache token is recoverable without launching Electron:
+        # the account already has an encrypted username/password in accounts.json.
+        # Refresh the protocol session first, then retry the same probe once. This
+        # avoids repeatedly starting a client just to recreate a missing cache.
+        if cfg.get('password'):
+            ok,reason=_refresh_probe_login(key,cfg,tok)
+            if ok:
+                event(key,"probe_token_refreshed",stage="协议登录刷新SohoToken成功，直接恢复协议探针",method="protocol_login",keepalive_confirmed=False)
+                probe_initialized.discard(key)
+                return probe_account(key,cfg)
+            return {'class':'unknown','reason':'缺少SohoToken且协议登录刷新失败：'+reason}
+        return {'class':'unknown','reason':'缺少SohoToken'}
     try:
         # The official v127 client performs collectInfo(2/1), then 3 and 4
         # after login. Without this post-login initialization the same token
@@ -1267,6 +1282,15 @@ async def worker(key):
             try:
                 reap_children()
                 result=await asyncio.to_thread(probe_account,key,cfg)
+                # Confirm a first shutdown observation after one second. This
+                # adds work only for abnormal accounts and shortens detection.
+                if result.get("class") in ("suspect","need"):
+                    event(key,"probe_fast_confirm",stage="首次异常，1秒后快速复核关机状态",delay_seconds=SUSPECT_FAST_CONFIRM_DELAY,vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
+                    await asyncio.sleep(SUSPECT_FAST_CONFIRM_DELAY)
+                    confirm=await asyncio.to_thread(probe_account,key,cfg)
+                    if confirm.get("class") not in ("suspect","need"):
+                        event(key,"probe_fast_recovered",stage="快速复核已恢复正常，取消重型保活",vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""),keepalive_confirmed=confirm.get("vmStatus") in (1,"1",25,"25"))
+                    result=confirm
                 now=time.time(); cls=str(result.get("class","unknown")); previous,count=probe_last.get(key,(None,0))
                 obs=probe_observation.setdefault(key,{"online_since":None,"last_probe_at":None,"last_class":None,"normal_probe_count":0,"suspect_count":0,"unknown_count":0,"need_count":0,"recovery_count":0,"last_recovery_at":None})
                 obs["last_probe_at"]=now; obs["last_class"]=cls
@@ -1281,7 +1305,13 @@ async def worker(key):
                 interval,interval_policy=_account_probe_interval(key)
                 event(key,"probe_result",stage=f"接口探针：{cls}，第{count}次连续结果",probe_class=cls,probe_count=count,vmStatus=result.get("vmStatus"),detail=result.get("reason",""),online_since=obs.get("online_since"),online_seconds=round(now-float(obs["online_since"])) if obs.get("online_since") else 0,probe_interval_seconds=interval,probe_interval_policy=interval_policy,observation_only=True)
                 if cls=="maybe_skip":
-                    event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
+                    vm=result.get("vmStatus")
+                    if vm in (25,"25"):
+                        obs["starting_until"]=now+STARTING_OBSERVE_WINDOW
+                        recovery_cooldown_until[key]=time.monotonic()+STARTING_RETRY_COOLDOWN
+                        event(key,"probe_starting",stage="接口探针确认云电脑已进入启动中，视为保活成功候选并跳过重复恢复",method="api_probe",evidence="vmStatus=25，等待云电脑自然完成启动",vmStatus=25,keepalive_confirmed=True,starting=True,observe_window_seconds=STARTING_OBSERVE_WINDOW,detail=result.get("reason",""))
+                    else:
+                        event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=vm,detail=result.get("reason",""))
                 elif cls in ("suspect","need"):
                     if count>=PROBE_CONSECUTIVE:
                         fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"

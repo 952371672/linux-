@@ -915,9 +915,33 @@ async def login_and_find(c,ws,key,cfg):
                 except Exception: pass
             await asyncio.sleep(1)
         state_url=str(state.get("url",'')); state_body=str(state.get("body",''))
-        if is_business_home(state):
-            event(key,"login_success",stage="已进入云电脑业务页，跳过登录表单",url=state_url,cloud_list_loaded=("暂无任何匹配结果" not in state_body),main_api=bool(c.eval("!!(window.mainApi&&window.mainApi.connectWorker)")))
+        if is_business_home(state) and "暂无任何匹配结果" not in state_body:
+            event(key,"cloud_list_loaded",stage="云电脑卡片已加载，允许进入SDK/点击保活",url=state_url,cloud_list_loaded=True)
             return c,ws,state
+        # An authenticated /home shell can temporarily have an empty list.
+        # Refresh this account's renderer a bounded number of times before
+        # allowing SDK/click fallback to run.
+        for refresh_attempt in range(2):
+            event(key,"cloud_list_empty",stage=f"登录后云电脑列表为空，刷新当前账号客户端（第{refresh_attempt+1}次）",url=state_url,cloud_list_loaded=False,page_snapshot=state)
+            try: c.eval("location.reload()")
+            except Exception: pass
+            await asyncio.sleep(3.0)
+            end_refresh=time.time()+15
+            while time.time()<end_refresh:
+                try:
+                    nt=page_target()
+                    if nt and nt.get("webSocketDebuggerUrl"):
+                        try: ws.close()
+                        except Exception: pass
+                        ws=websocket.create_connection(nt["webSocketDebuggerUrl"],timeout=15); c=CDP(ws)
+                    state=capture_snapshot(c); body_now=str(state.get("body",''))
+                    event(key,"cloud_list_probe",stage="刷新后等待云电脑卡片",ready="暂无任何匹配结果" not in body_now,detail=body_now[:320],page_snapshot=state)
+                    if is_business_home(state) and "暂无任何匹配结果" not in body_now:
+                        event(key,"cloud_list_loaded",stage="刷新后云电脑卡片已加载",url=state.get("url",""),cloud_list_loaded=True)
+                        return c,ws,state
+                except Exception: pass
+                await asyncio.sleep(1)
+        raise TimeoutError("登录成功但云电脑卡片未加载：/home 持续显示暂无任何匹配结果")
     state_url=str(state.get("url",'')); state_body=str(state.get("body",''))
     if "#/login" not in state_url and "账密登录" not in state_body and "子账号登录" not in state_body:
         event(key,"privacy_navigation_timeout",stage="隐私确认后未进入登录页",detail=str(state)[:500],page_snapshot=state)
@@ -1019,6 +1043,12 @@ async def sdk_keepalive(key,c,ws,cfg):
       const readStore=k=>{try{return unbox(localStorage.getItem(k))}catch(e){return null}};
       let clouds=readStore('clouds');
       if(typeof clouds==='string'){try{clouds=JSON.parse(clouds)}catch(e){}}
+      if(!Array.isArray(clouds)){
+        for(const source of [window.clouds,window.cloudList,window.state?.clouds,window.store?.clouds,window.store?.state?.clouds]){
+          if(Array.isArray(source)){clouds=source;break}
+          if(source&&Array.isArray(source.list)){clouds=source.list;break}
+        }
+      }
       if(!Array.isArray(clouds)) clouds=[];
       const cloud=clouds.find(x=>x&&x.userServiceId) || null;
       if(!cloud)return {done:true,error:'cloud card unavailable in localStorage.clouds',cloudsType:typeof clouds,cloudsLen:Array.isArray(clouds)?clouds.length:null};
@@ -1042,7 +1072,15 @@ async def sdk_keepalive(key,c,ws,cfg):
       }).catch(e=>{window.__cmcc_sdk={done:true,error:'getFirmAuth exception: '+String(e),result:null,phase:'getFirmAuthError',userServiceId};});
       return {done:false,started:true,userServiceId,cloudKeys:safeKeys(cloud),cloudSpuCode:cloud.spuCode||null};
     })()"""
-    initial=c.eval(expr);event(key,"sdk_invoked",stage="已按官方流程获取firmAuth并调用 mainApi.connectWorker",detail=str(initial)[:500])
+    initial=c.eval(expr)
+    for retry in range(3):
+        if not (isinstance(initial,dict) and initial.get("error") == "cloud card unavailable in localStorage.clouds"):
+            break
+        event(key,"cloud_list_retry",stage=f"SDK读取云电脑卡片为空，等待刷新重试（第{retry+1}次）",cloud_list_loaded=False)
+        await asyncio.sleep(2.0)
+        try: initial=c.eval(expr)
+        except Exception: break
+    event(key,"sdk_invoked",stage="已按官方流程获取firmAuth并调用 mainApi.connectWorker",detail=str(initial)[:500])
     if isinstance(initial,dict) and initial.get("done"):
         raise RuntimeError(str(initial.get("error"))[:220])
     for n in range(1,31):
@@ -1156,7 +1194,7 @@ async def run_once(key,cfg):
         raise
     except Exception as e:
         streak=recovery_failure_streak.get(key,0)+1; recovery_failure_streak[key]=streak
-        cooldown=min(300.0,RECOVERY_FAILURE_COOLDOWN*(2**min(streak-1,2)))
+        cooldown=min(120.0,RECOVERY_FAILURE_COOLDOWN*(2**min(streak-1,2)))
         recovery_cooldown_until[key]=time.monotonic()+cooldown
         event(key,"recovery_failed",stage=f"恢复未成功，{int(cooldown)}秒后允许下一次重试",reason=f"{type(e).__name__}: {str(e)[:220]}",failure_streak=streak,cooldown_seconds=int(cooldown))
         return False
@@ -1525,6 +1563,8 @@ async def bulk_start(x:BulkStartIn=BulkStartIn()):
         if key not in all_accounts:
             missing.append(key); continue
         stopped_accounts.discard(key)
+        recovery_cooldown_until.pop(key,None)
+        recovery_failure_streak.pop(key,None)
         all_accounts[key]["autostart"]=True
         event(key,"action_received",stage="收到用户操作：start",action="start")
         old=tasks.get(key)
@@ -1540,6 +1580,9 @@ async def action(key:str,x:Action):
     if x.action in ("start","run"):
         event(key,"action_received",stage=f"收到用户操作：{x.action}",action=x.action)
         stopped_accounts.discard(key)
+        recovery_cooldown_until.pop(key,None)
+        recovery_failure_streak.pop(key,None)
+        event(key,"recovery_cooldown_reset",stage="手动重新开始，已清除失败冷却并刷新恢复流程",reason="manual_start")
         cfg=read_accounts().get(key)
         if cfg:
             cfg["autostart"]=True
@@ -1553,6 +1596,8 @@ async def action(key:str,x:Action):
     elif x.action=="stop":
         event(key,"action_received",stage="收到用户操作：stop",action="stop")
         stopped_accounts.add(key)
+        recovery_cooldown_until.pop(key,None)
+        recovery_failure_streak.pop(key,None)
         all_accounts=read_accounts()
         if key in all_accounts:
             all_accounts[key]["autostart"]=False

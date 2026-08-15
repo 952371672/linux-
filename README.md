@@ -1,18 +1,7 @@
 # CMCC 云电脑 Linux Docker 保活系统
-## v1.5.0-dynamic-test 动态探针策略
 
-- 每个账号独立探针 worker，不使用全局批量探测。
-- 恢复后约 10 秒首次探测；稳定 1 分钟后约 30 秒；在线超过 15 分钟约 10 秒。
-- 探测间隔应用约 ±10% 抖动；连续两次 suspect/need 才进入兜底恢复。
-- 首次 suspect/need 后约 1 秒进行一次快速复核；复核恢复则取消重型恢复。
-- `vmStatus=25` 表示云电脑已进入开机流程，保活动作已生效；进入 30 秒启动观察窗口，避免重复启动客户端。
-- `vmStatus=1` 表示正常运行；`vmStatus=23` 表示关机，需经过确认后恢复。
-- 缺少 SohoToken 时优先使用已保存的账号密码执行协议登录刷新，失败后才使用客户端兜底。
-- 保留固定 6 个兜底槽位：slot0-slot5，对应 DISPLAY :100-:105、CDP 9223-9228。
-- WebUI 计数按当前账号状态统计，实时日志中的探针汇总按同一账号集合统计。
-
-
-> 当前版本：**v1.5.0-dynamic-test**（动态探针与快速异常复核版）。健康账号不会启动客户端；探针按账号在线阶段使用约 10/30/10 秒策略。
+> 本发布按服务器 `/opt/cmcc-linux-docker` 的实际运行基线同步，
+> 版本为 `1.5.0-dynamic-test`。发布包不包含账号、Token、profile、`.env`、事件日志或协议实验文件。
 
 一个面向 Linux Docker 服务器的 CMCC 云电脑协议探针与客户端兜底保活系统。
 
@@ -23,11 +12,11 @@
 ```text
 保存账号登录缓存 / Token
         ↓
-按账号在线阶段以约 10/30/10 秒节奏进行协议/API 探针，读取真实云电脑状态
+每 10 秒协议/API 探针读取真实云电脑状态
         ↓
 状态正常：不启动客户端、不点击、不占用客户端槽位
         ↓
-首次异常约 1 秒快速复核；连续确认疑似关机或需要启动
+连续确认疑似关机或需要启动
         ↓
 占用受控客户端槽位
         ↓
@@ -45,7 +34,7 @@ SDK 失败后使用官方客户端 + CDP 点击兜底
 - 协议/API 实时探针，默认约每 10 秒检查一次；
 - 正常账号跳过客户端，降低 CPU、内存和进程数量；
 - SDK 优先保活，官方客户端/CDP 作为兜底；
-- 固定 6 个独立客户端槽位，彼此独立（Xvfb/x11vnc 常驻，Electron 按需创建并清理）：
+- 6 个独立客户端槽位，彼此独立（按需创建，使用完销毁）：
   - `slot0`：DISPLAY `:100`，CDP `9223`，VNC `5901`；
   - `slot1`：DISPLAY `:101`，CDP `9224`，VNC `5902`；
   - `slot2`：DISPLAY `:102`，CDP `9225`，VNC `5903`；
@@ -55,67 +44,64 @@ SDK 失败后使用官方客户端 + CDP 点击兜底
 - 账号列表、状态、当前阶段和阶段日志 WebUI；
 - 批量导入、批量导出、启动、停止、删除；
 - WebUI Basic Auth 和在线修改密码；
-- noVNC 观察实际正在运行的客户端槽位；槽位的 Xvfb/x11vnc 在容器启动时常驻，Electron/profile/CDP 仅在兜底任务期间按需创建并在任务结束后销毁；
+- noVNC 观察实际正在运行的客户端槽位；槽位的 Xvfb/x11vnc 仅在兜底任务期间按需创建，并在任务结束后销毁；
 - Docker 开机自启动和容器 `unless-stopped`；
 - 事件日志尾部读取，避免日志不断增长导致内存占用增加；
 - 实时阶段日志和协议探针汇总；事件日志按大小自动轮转，避免长期运行占满磁盘。
 
 ## 一键安装
 
-### GitHub 安装（只访问 GitHub）
+### GitHub 安装
 
 ```bash
-curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
-  https://raw.githubusercontent.com/952371672/linux-/main/install.sh | sudo bash
+curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
+  'https://raw.githubusercontent.com/952371672/linux-/main/install.sh' | sudo bash
 ```
 
-GitHub 安装脚本只从 GitHub Release 下载 `stable-latest/CMCC.Docker.zip`，不会访问 CNB 或读取 CNB Token。
-
-### 已安装版本更新
-
-更新前请确认服务器上的账号、Token、profile 和 WebUI 密码都在 `/opt/cmcc-linux-docker/data/` 或 `.env` 中。更新脚本会保留 `data/`、`.env` 和 `data/webui-auth.json`，不会删除账号运行数据。
+### CNB 安装
 
 ```bash
-curl --http1.1 -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
-  https://raw.githubusercontent.com/952371672/linux-/main/update.sh -o /tmp/cmcc-update.sh
-sudo bash /tmp/cmcc-update.sh
+curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
+  'https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/install.sh' | sudo bash
 ```
 
-也可以先下载完整包，再使用本地包更新（适合 GitHub 下载不稳定的服务器）：
+安装脚本会自动完成：
+
+1. 下载固定发布资产 `stable-latest/CMCC.Docker.zip`；
+2. 解压项目文件；
+3. 保留已有 `data/`、`.env` 和 WebUI 认证配置；
+4. 构建 amd64 Docker 镜像；
+5. 启动 `cmcc-linux-docker-cmcc-1`；
+6. 检查容器和健康状态。
+
+如果服务器访问 GitHub 受限，也可以先将 `CMCC.Docker.zip` 放在当前目录，安装脚本会优先使用本地压缩包。
+
+## 更新已有安装
+
+推荐使用固定更新脚本。更新前不要删除 `data/`，其中包含账号、密码加密数据、Token、登录缓存、profile 和运行数据。
+
+### GitHub 更新
 
 ```bash
-scp CMCC.Docker.zip root@服务器IP:/tmp/CMCC.Docker.zip
-ssh root@服务器IP 'CMCC_LOCAL_ARCHIVE=/tmp/CMCC.Docker.zip bash -s' < update.sh
+curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
+  'https://raw.githubusercontent.com/952371672/linux-/main/update.sh' | sudo bash
 ```
 
-更新脚本会自动校验 ZIP、停止旧容器、保留 `data/` 和 `.env`、重建镜像并启动新版本。更新完成后检查：
+### CNB 更新
 
 ```bash
-cd /opt/cmcc-linux-docker
-docker compose -f novnc-compose.yml ps
-curl -u 'admin:你的WebUI密码' http://127.0.0.1:8080/health
+curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
+  'https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/update.sh' | sudo bash
 ```
 
-### CNB 安装/更新
+更新脚本具有版本标记判断：如果当前服务器已经是同一个 `stable-latest` 资产，不会重复下载、停止容器或重建镜像。
 
-CNB 使用独立的公开 OCI 制品渠道，不使用 GitHub 下载地址，也不需要填写 Token。CNB 网页的 `/-/raw/` 地址在未登录时可能返回 HTML 页面，不能直接管道给 `bash`，否则会出现 `curl: (23) Failure writing output to destination`。请先通过 Git 克隆脚本，再本地执行：
+更新时只清理当前 Compose 项目的旧资源，不使用全局 Docker 清理命令。不会执行：
 
 ```bash
-TMP_DIR="$(mktemp -d)"
-git clone --depth 1 https://cnb.cool/952371672/cmcc-linux-docker.git "$TMP_DIR/cmcc-linux-docker"
-sudo bash "$TMP_DIR/cmcc-linux-docker/install.sh"
-rm -rf "$TMP_DIR"
+docker system prune -a
+docker image prune -a
 ```
-
-在已有 CNB 安装上重复执行同一命令即可更新。脚本会保留 `/opt/cmcc-linux-docker/data/`、`.env` 和 WebUI 持久化密码，然后重新构建并启动容器。
-
-如果服务器无法直接访问 CNB，可在能下载文件的电脑上下载 `CMCC.Docker.zip`，上传到服务器后执行：
-
-```bash
-sudo CMCC_LOCAL_ARCHIVE=/tmp/CMCC.Docker.zip bash install.sh
-```
-
-> GitHub 更新只使用 GitHub Release；CNB 安装/更新只使用 CNB OCI 制品。不要混用两个渠道的安装脚本。
 
 ## WebUI 首次登录密码（重要）
 
@@ -272,12 +258,3 @@ curl -I http://127.0.0.1:6080/vnc.html
 
 - GitHub：<https://github.com/952371672/linux->
 - CNB：<https://cnb.cool/952371672/cmcc-linux-docker>
-
-## 稳定性修复说明
-
-当前版本包含以下修复：
-
-- 已认证的 `#/home` 云电脑业务页即使暂时显示“暂无任何匹配结果”，也不会再被误判为登录页切换失败；
-- 隐私确认后如果 Electron 替换 renderer，会重新发现当前页面并在有限次数内重试；
-- CDP 遇到 `No such target id`、旧 WebSocket 失效或远程连接短暂断开时，会重新附着当前页面；
-- 业务页状态会优先于登录表单判断，减少重复登录和客户端重启。

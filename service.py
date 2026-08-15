@@ -442,6 +442,9 @@ def clear_stale_profile_locks(profile):
             except Exception: pass
     except Exception: pass
 
+class EmptyCloudListNeedsRestart(RuntimeError):
+    """The renderer session is stale; a page reload did not rebuild cloud state."""
+
 def kill_port_owner(port):
     """Release only the process group currently owning one slot CDP port."""
     try:
@@ -797,7 +800,7 @@ async def screenshot_page(key,c,stage="页面截图"):
 async def screenshot_quiet(key,c):
     return None
 
-async def login_and_find(c,ws,key,cfg):
+async def login_and_find(c,ws,key,cfg,allow_client_restart=True):
     event(key,"privacy",stage="客户端已启动，等待隐私确认")
     privacy_seen=False
     # Privacy is persisted per Electron profile. On later launches the client can
@@ -935,13 +938,18 @@ async def login_and_find(c,ws,key,cfg):
                         except Exception: pass
                         ws=websocket.create_connection(nt["webSocketDebuggerUrl"],timeout=15); c=CDP(ws)
                     state=capture_snapshot(c); body_now=str(state.get("body",''))
-                    event(key,"cloud_list_probe",stage="刷新后等待云电脑卡片",ready="暂无任何匹配结果" not in body_now,detail=body_now[:320],page_snapshot=state)
-                    if is_business_home(state) and "暂无任何匹配结果" not in body_now:
+                    on_login="#/login" in str(state.get("url",'')) or ("手机号" in body_now and "验证码" in body_now)
+                    card_ready=is_business_home(state) and not on_login and "暂无任何匹配结果" not in body_now and any(x in body_now for x in ("家庭云电脑","个人云电脑","已关机","连接","运行中","正常","已连接"))
+                    event(key,"cloud_list_probe",stage="刷新后等待云电脑卡片",ready=card_ready,on_login=on_login,detail=body_now[:320],page_snapshot=state)
+                    if card_ready:
                         event(key,"cloud_list_loaded",stage="刷新后云电脑卡片已加载",url=state.get("url",""),cloud_list_loaded=True)
                         return c,ws,state
                 except Exception: pass
                 await asyncio.sleep(1)
-        raise TimeoutError("登录成功但云电脑卡片未加载：/home 持续显示暂无任何匹配结果")
+        if allow_client_restart:
+            event(key,"client_restart_for_empty_clouds",stage="刷新一次仍无云电脑，准备重启当前账号客户端",reason="reload_did_not_rebuild_cloud_state",cloud_list_loaded=False,page_snapshot=state)
+            raise EmptyCloudListNeedsRestart("页面刷新后云电脑列表仍为空，需重启客户端")
+        raise TimeoutError("重启客户端后云电脑卡片仍未加载：/home 持续显示暂无任何匹配结果")
     state_url=str(state.get("url",'')); state_body=str(state.get("body",''))
     if "#/login" not in state_url and "账密登录" not in state_body and "子账号登录" not in state_body:
         event(key,"privacy_navigation_timeout",stage="隐私确认后未进入登录页",detail=str(state)[:500],page_snapshot=state)
@@ -1262,7 +1270,30 @@ async def _run_once_heavy(key,cfg,slot):
         t=ready[1]
         ws=websocket.create_connection(t["webSocketDebuggerUrl"],timeout=15);c=CDP(ws)
 
-        c,ws,info=await login_and_find(c,ws,key,cfg)
+        try:
+            c,ws,info=await login_and_find(c,ws,key,cfg,allow_client_restart=True)
+        except EmptyCloudListNeedsRestart as restart_error:
+            # A renderer reload does not recreate the vendor client's cloud
+            # store/session. Restart this account once inside the same bounded
+            # recovery attempt, then let the normal cooldown handle a second
+            # failure. Keep the persisted profile and token intact.
+            event(key,"client_restart_begin",stage="空云列表刷新无效，停止并重启当前账号客户端",reason=str(restart_error)[:220],restart_attempt=1)
+            try:
+                if ws: ws.close()
+            except Exception: pass
+            active_clients.pop(key,None)
+            stop_client(p,log)
+            kill_profile_clients(str(profile)); clear_stale_profile_locks(str(profile))
+            await asyncio.sleep(1)
+            p,log=start_client(str(profile),slot["port"],slot["display"]); active_clients[key]=(p,log)
+            event(key,"client_restart_started",stage="当前账号客户端已重启，重新等待业务页",restart_attempt=1,slot=slot["name"],cdp_port=slot["port"])
+            ready=await wait_page_or_api(timeout=35,key=key,profile=str(profile),log=log,port=slot["port"])
+            if ready[0]=="running":
+                event(key,"success",stage="重启客户端后确认云电脑已运行中",method="current_launch_api_state",evidence="重启后当前启动日志/MQTT vmStatus=1",reason="restart_launch_vmStatus_1",vmStatus=1,keepalive_confirmed=True)
+                return
+            t=ready[1]
+            ws=websocket.create_connection(t["webSocketDebuggerUrl"],timeout=15); c=CDP(ws)
+            c,ws,info=await login_and_find(c,ws,key,cfg,allow_client_restart=False)
         if "#/home" in str(info.get("url",'')) and "暂无任何匹配结果" not in str(info.get("body",'')) and any(x in str(info.get("body",'')) for x in ("连接","运行中","正常","已关机","家庭云电脑","个人云电脑")):
             # Short-circuit an already-running cloud before SDK/click. The renderer
             # may expose vmStatus=1 even when the card text is delayed.

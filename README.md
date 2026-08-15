@@ -1,8 +1,5 @@
 # CMCC 云电脑 Linux Docker 保活系统
 
-> 本发布按服务器 `/opt/cmcc-linux-docker` 的实际运行基线同步，
-> 版本为 `1.5.0-dynamic-test`。发布包不包含账号、Token、profile、`.env`、事件日志或协议实验文件。
-
 一个面向 Linux Docker 服务器的 CMCC 云电脑协议探针与客户端兜底保活系统。
 
 ## 核心工作方式

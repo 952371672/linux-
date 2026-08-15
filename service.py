@@ -27,7 +27,7 @@ if os.environ.get("CMCC_SECRET"):
 else:
     if not SECRET.exists(): SECRET.write_bytes(Fernet.generate_key()); SECRET.chmod(0o600)
     _fernet=Fernet(SECRET.read_bytes())
-APP_VERSION="1.5.0-dynamic-test"
+APP_VERSION="1.5.3-state-map-observe"
 app=FastAPI(title=f"CMCC Linux v127 Keepalive {APP_VERSION}",version=APP_VERSION)
 WEBUI_USER=os.environ.get("CMCC_WEBUI_USER","").strip()
 WEBUI_PASSWORD=os.environ.get("CMCC_WEBUI_PASSWORD","")
@@ -65,6 +65,7 @@ states:dict[str,dict[str,Any]]={}; account_locks:dict[str,asyncio.Lock]={}; sche
 active_run_keys:set[str]=set()
 active_clients:dict[str,tuple[Any,Any]]={}
 probe_last:dict[str,tuple[str,float]]={}
+probe_state_last:dict[str,object]={}
 probe_initialized:set[str]=set()
 # Observation-only telemetry: persisted per-account online/probe history.
 # This release deliberately keeps the effective probe cadence unchanged at 10s.
@@ -122,11 +123,17 @@ CLIENT_SLOTS=(
 )
 class DynamicSlotLimiter:
     def __init__(self, limit):
-        self.limit=max(1,min(len(CLIENT_SLOTS),int(limit))); self.active=0; self.condition=asyncio.Condition()
+        self.limit=max(1,min(len(CLIENT_SLOTS),int(limit))); self.active=0; self.condition=asyncio.Condition(); self.waiters=[]
     async def acquire(self):
         async with self.condition:
-            await self.condition.wait_for(lambda: self.active < self.limit)
-            self.active += 1
+            ticket=asyncio.get_running_loop().create_future(); self.waiters.append(ticket)
+            try:
+                while self.waiters[0] is not ticket or self.active >= self.limit:
+                    await self.condition.wait()
+                self.waiters.pop(0); self.active += 1
+            except asyncio.CancelledError:
+                if ticket in self.waiters: self.waiters.remove(ticket); self.condition.notify_all()
+                raise
     async def release(self):
         async with self.condition:
             self.active=max(0,self.active-1); self.condition.notify_all()
@@ -1211,6 +1218,7 @@ async def run_once(key,cfg):
 
 async def _run_once_slot(key,cfg):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.
+    event(key,"fallback_slot_wait",stage="等待兜底保活槽位（FIFO）",active=list(fallback_active),active_count=len(fallback_active),limit=fallback_slots.limit,queued_waiters=len(fallback_slots.waiters),allocation="fifo")
     async with fallback_slots:
         slot=await slot_pool.get(); token=current_slot.set(slot)
         try:
@@ -1361,6 +1369,11 @@ async def worker(key):
                         event(key,"probe_fast_recovered",stage="快速复核已恢复正常，取消重型保活",vmStatus=confirm.get("vmStatus"),detail=confirm.get("reason",""),keepalive_confirmed=confirm.get("vmStatus") in (1,"1",25,"25"))
                     result=confirm
                 now=time.time(); cls=str(result.get("class","unknown")); previous,count=probe_last.get(key,(None,0))
+                vm_state=result.get("vmStatus")
+                if vm_state != probe_state_last.get(key):
+                    state_candidates={1:"运行中（候选）",16:"开机（候选）",21:"关机中（候选）",23:"已关机（候选）",25:"启动中（候选）"}
+                    event(key,"state_transition_observed",stage="观察到云电脑状态码变化（用于确认UI映射）",from_vmStatus=probe_state_last.get(key),to_vmStatus=vm_state,candidate_ui_state=state_candidates.get(vm_state,"未知"),detail=result.get("reason",""),mapping_basis="protocol_probe_only_not_final")
+                    probe_state_last[key]=vm_state
                 obs=probe_observation.setdefault(key,{"online_since":None,"last_probe_at":None,"last_class":None,"normal_probe_count":0,"suspect_count":0,"unknown_count":0,"need_count":0,"recovery_count":0,"last_recovery_at":None})
                 obs["last_probe_at"]=now; obs["last_class"]=cls
                 if cls=="maybe_skip":

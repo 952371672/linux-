@@ -1,2 +1,5 @@
 
 CMCC.Docker.zip
+*.deb
+__pycache__/
+

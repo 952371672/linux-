@@ -2,12 +2,13 @@
 set -Eeuo pipefail
 APP_DIR="${APP_DIR:-/opt/cmcc-linux-docker}"
 PORT="${CMCC_PORT:-8080}"
+CNB_IMAGE="${CNB_IMAGE:-docker.cnb.cool/952371672/cmcc-linux-docker:stable-latest}"
 ASSET="CMCC.Docker.zip"
 DOCKER_INSTALL_URL="${DOCKER_INSTALL_URL:-https://get.docker.com}"
 DOCKER_MIRRORS="${DOCKER_MIRRORS:-https://docker.m.daocloud.io,https://dockerproxy.net,https://docker.1ms.run}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 step() { printf '\n==== [%s] %s ====\n' "$1" "$2"; }
-progress_download() { local url="$1" out="$2"; rm -f "$out"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --max-time 1800 --progress-bar --show-error "$url" -o "$out"; printf '\n下载完成：%s\n' "$out"; }
+progress_download() { local url="$1" out="$2"; shift 2; rm -f "$out"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --max-time 1800 --progress-bar --show-error "$@" "$url" -o "$out"; printf '\n下载完成：%s\n' "$out"; }
 step 1 '检查运行权限与系统依赖'
 [[ "$(id -u)" == 0 ]] || { echo '请使用 root 或 sudo 运行'; exit 1; }
 SUDO=''
@@ -101,8 +102,33 @@ ARCHIVE="$TMP/$ASSET"
 if [[ -n "$FOUND" && -f "$FOUND" ]]; then
   echo "使用本地安装包：$(readlink -f "$FOUND")"; cp -f "$FOUND" "$ARCHIVE"
 else
-  step 4 '从 GitHub Release 下载完整安装包（显示实时进度）'
-  progress_download 'https://github.com/952371672/linux-/releases/download/stable-latest/CMCC.Docker.zip' "$ARCHIVE"
+  echo '从 CNB 公开制品获取安装包（无需登录和Token）'
+  REGISTRY="https://${CNB_IMAGE%%/*}"
+  REF="${CNB_IMAGE#*/}"; TAG="${REF##*:}"; REPO="${REF%:*}"
+  TOKEN_URL="$REGISTRY/service/token?service=cnb-registry&scope=repository:${REPO}:pull"
+  curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --progress-bar --show-error "$TOKEN_URL" -o "$TMP/token.json"
+  AUTH_VALUE="$(python3 - "$TMP/token.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf8'))
+print(p.get('token') or p.get('access_token') or '')
+PY
+)"
+  [[ -n "$AUTH_VALUE" ]] || { echo 'CNB匿名制品Token获取失败'; exit 1; }
+  printf 'Authorization: Bearer %s\n' "$AUTH_VALUE" > "$TMP/auth.header"
+  curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --progress-bar --show-error -H "@${TMP}/auth.header" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "$REGISTRY/v2/$REPO/manifests/$TAG" -o "$TMP/manifest.json"
+  LAYER="$(python3 - "$TMP/manifest.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf8'))
+for x in p.get('layers',[]):
+ if x.get('annotations',{}).get('org.opencontainers.image.title')=='CMCC.Docker.zip' or x.get('mediaType')=='application/zip':
+  print(x['digest']); break
+else: raise SystemExit('CNB制品中找不到 CMCC.Docker.zip 层')
+PY
+)"
+  [[ "$LAYER" == sha256:* ]] || exit 1
+  step 4 '从 CNB 下载完整安装包（显示实时进度）'
+  progress_download "$REGISTRY/v2/$REPO/blobs/$LAYER" "$ARCHIVE" -H "@${TMP}/auth.header"
+  printf '\nCNB 安装包下载完成：%s bytes\n' "$(stat -c %s "$ARCHIVE" 2>/dev/null || wc -c < "$ARCHIVE")"
 fi
 step 5 '校验并解压安装包'
 [[ -s "$ARCHIVE" ]] || { echo '安装包为空'; exit 1; }
@@ -129,5 +155,5 @@ step 7 '启动服务并检查状态'
 docker compose -f novnc-compose.yml up -d
 sleep 5; docker compose -f novnc-compose.yml ps
 WEBUI_USER="$(sed -n 's/^CMCC_WEBUI_USER=//p' "$APP_DIR/.env" | tail -n 1)"; WEBUI_PASSWORD="$(sed -n 's/^CMCC_WEBUI_PASSWORD=//p' "$APP_DIR/.env" | tail -n 1)"
-printf '\n========================================\nGitHub 安装完成\nWebUI 登录地址：http://服务器IP:%s/\nWebUI 用户名：%s\nWebUI 密码：%s\n========================================\n' "$PORT" "${WEBUI_USER:-admin}" "${WEBUI_PASSWORD:-admin}"
+printf '\n========================================\nCNB 安装完成\nWebUI 登录地址：http://服务器IP:%s/\nWebUI 用户名：%s\nWebUI 密码：%s\n========================================\n' "$PORT" "${WEBUI_USER:-admin}" "${WEBUI_PASSWORD:-admin}"
 echo '请首次登录后立即修改密码；以上凭据不会写入日志。'

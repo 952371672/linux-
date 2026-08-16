@@ -5,10 +5,10 @@
 ## 当前版本
 
 ```text
-1.5.3-state-map-observe
+1.5.5-25-starting-success
 ```
 
-本版本新增状态码变化观测日志，用于确认协议状态码与客户端 UI 状态的对应关系；不改变原有保活判断、SDK/CDP/点击兜底、六槽位和 FIFO 调度逻辑。
+本版本优化 23 状态恢复确认：检测到 vmStatus=25（开机中）即记录为已进入开机流程，不再等待短暂的 25→1；SDK 返回后仍保留协议状态证据，避免把 SDK 返回误报为云端成功。保留 21→23 等待、SDK/CDP/点击兜底、六槽位和账号级重试。
 
 当前已观测到的状态映射：
 
@@ -17,7 +17,7 @@ vmStatus=1  运行中
 vmStatus=16 开机（持续观测确认中）
 vmStatus=21 关机中
 vmStatus=23 已关机
-vmStatus=25 启动中
+vmStatus=25 启动中（检测到即视为已进入开机流程）
 ```
 
 已验证状态链：`1 → 21 → 23 → 25 → 1`。事件日志会记录 `state_transition_observed`，并保留 `from_vmStatus`、`to_vmStatus`、候选 UI 状态及原始协议详情。

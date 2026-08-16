@@ -27,7 +27,7 @@ if os.environ.get("CMCC_SECRET"):
 else:
     if not SECRET.exists(): SECRET.write_bytes(Fernet.generate_key()); SECRET.chmod(0o600)
     _fernet=Fernet(SECRET.read_bytes())
-APP_VERSION="1.5.3-state-map-observe"
+APP_VERSION="1.5.5-25-starting-success"
 app=FastAPI(title=f"CMCC Linux v127 Keepalive {APP_VERSION}",version=APP_VERSION)
 WEBUI_USER=os.environ.get("CMCC_WEBUI_USER","").strip()
 WEBUI_PASSWORD=os.environ.get("CMCC_WEBUI_PASSWORD","")
@@ -87,7 +87,7 @@ def _save_probe_observation():
 # immediately monopolising a slot again.
 recovery_cooldown_until:dict[str,float]={}
 recovery_failure_streak:dict[str,int]={}
-RECOVERY_FAILURE_COOLDOWN=60.0
+RECOVERY_FAILURE_COOLDOWN=300.0
 SUSPECT_FAST_CONFIRM_DELAY=1.0
 STARTING_OBSERVE_WINDOW=30.0
 STARTING_RETRY_COOLDOWN=30.0
@@ -1038,6 +1038,21 @@ async def login_and_find(c,ws,key,cfg,allow_client_restart=True):
         event(key,"waiting_login",stage="等待业务页",detail=last[:240],page_snapshot=info if isinstance(info,dict) else {"body":last})
         await screenshot_page(key,c,"等待业务页")
     raise RuntimeError("login/cloud list not confirmed; 未确认业务页")
+async def confirm_sdk_recovery_state(key,cfg,started_at=None):
+    deadline=time.monotonic()+60.0; last=object()
+    while time.monotonic()<deadline:
+        result=await asyncio.to_thread(probe_account,key,cfg); vm=result.get("vmStatus")
+        if vm != last:
+            last=vm; event(key,"recovery_state_check",stage="SDK后确认云端状态",vmStatus=vm,detail=result.get("reason",""),source="protocol_probe",elapsed_seconds=round(time.time()-(started_at or time.time()),1))
+        if vm in (1,"1"):
+            event(key,"recovery_state_confirmed",stage="SDK后确认云电脑已运行中",vmStatus=1,source="protocol_probe",keepalive_confirmed=True); return True
+        if vm in (25,"25"):
+            # Observed behavior: 25 is a short-lived boot state and normally progresses to 1.
+            event(key,"recovery_state_confirmed",stage="SDK后确认云电脑已进入开机中",vmStatus=25,source="protocol_probe",keepalive_confirmed=True,starting=True,success_candidate=True,confirmation_basis="observed_25_to_1_behavior")
+            return True
+        await asyncio.sleep(2.0)
+    raise TimeoutError("SDK已返回但60秒内未确认vmStatus=1")
+
 async def sdk_keepalive(key,c,ws,cfg):
     ok,st,rt=already_running(c)
     if ok:
@@ -1102,7 +1117,9 @@ async def sdk_keepalive(key,c,ws,cfg):
         await asyncio.sleep(1);r=c.eval("window.__cmcc_sdk||null");event(key,"sdk_poll",stage=f"SDK执行中 {n}s",detail=str({k:r.get(k) for k in ('done','error','phase','userServiceId','optionKeys','spuCode','vmId') if isinstance(r,dict) and k in r})[:500] if isinstance(r,dict) else str(r)[:300])
         if isinstance(r,dict) and r.get("done"):
             if r.get("error"):raise RuntimeError("SDK失败: "+str(r["error"])[:220])
-            event(key,"success",stage="保活成功：SDK connectWorker 已完成",method="sdk_connectWorker",evidence="SDK完成后返回并记录done=true",reason="sdk_connectWorker",keepalive_confirmed=True,spuCode=r.get('spuCode'),vmId=r.get('vmId'));return True
+            event(key,"sdk_returned",stage="SDK已返回，开始确认云端状态",method="sdk_connectWorker",evidence="SDK返回不等于云端已恢复",reason="sdk_connectWorker",spuCode=r.get('spuCode'),vmId=r.get('vmId'))
+            await confirm_sdk_recovery_state(key,cfg,started_at=time.time())
+            event(key,"success",stage="SDK后已确认云电脑运行中",method="sdk_connectWorker",evidence="协议探针确认vmStatus=1",reason="sdk_connectWorker_state_confirmed",keepalive_confirmed=True,vmStatus=1,spuCode=r.get('spuCode'),vmId=r.get('vmId'));return True
     raise TimeoutError("SDK connectWorker 超时")
 async def click_fallback(key,c,ws,cfg):
     event(key,"click_fallback",stage="SDK失败，进入普通点击保活兜底",method="client_click_fallback",trigger="sdk_failed",next="connect_button_then_state_confirmation")
@@ -1186,35 +1203,28 @@ async def click_fallback(key,c,ws,cfg):
     except Exception: pass
     raise RuntimeError("点击后状态未恢复：未观察到稳定运行中状态；最后卡片状态="+before_card[:220]+"；最后页面="+last[:320])
 async def run_once(key,cfg):
-    # Single-flight across probe, realtime and manual entrypoints. A duplicate
-    # trigger must not start another Electron/profile/CDP recovery in parallel.
     if key in active_run_keys:
         event(key,"run_coalesced",stage="账号已有保活任务运行，合并重复触发",reason="single_flight")
         return False
     now=time.monotonic(); until=recovery_cooldown_until.get(key,0.0)
     if until>now:
-        remaining=max(1,int(until-now))
-        event(key,"recovery_cooldown",stage=f"该账号上次恢复失败，冷却{remaining}秒后再试",reason="failed_recovery_cooldown",cooldown_remaining=remaining)
-        return False
-    active_run_keys.add(key)
+        remaining=max(1,int(until-now)); event(key,"recovery_cooldown",stage=f"该账号仍在冷却，{remaining}秒后再试",reason="failed_recovery_cooldown",cooldown_remaining=remaining); return False
+    active_run_keys.add(key); retry_delays=(5.0,15.0)
     try:
-        result=await _run_once_slot(key,cfg)
-        # The API-state shortcut returns None after it has emitted a verified
-        # success event; only an explicit False is an unconfirmed recovery.
-        if result is False:
-            raise RuntimeError("SDK/客户端恢复未确认成功")
-        recovery_failure_streak.pop(key,None); recovery_cooldown_until.pop(key,None)
-        return True
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        streak=recovery_failure_streak.get(key,0)+1; recovery_failure_streak[key]=streak
-        cooldown=min(120.0,RECOVERY_FAILURE_COOLDOWN*(2**min(streak-1,2)))
-        recovery_cooldown_until[key]=time.monotonic()+cooldown
-        event(key,"recovery_failed",stage=f"恢复未成功，{int(cooldown)}秒后允许下一次重试",reason=f"{type(e).__name__}: {str(e)[:220]}",failure_streak=streak,cooldown_seconds=int(cooldown))
-        return False
-    finally:
-        active_run_keys.discard(key)
+        last_error=None
+        for attempt in range(1,4):
+            try:
+                result=await _run_once_slot(key,cfg)
+                if result is False: raise RuntimeError("SDK/客户端恢复未确认成功")
+                recovery_failure_streak.pop(key,None); recovery_cooldown_until.pop(key,None); return True
+            except asyncio.CancelledError: raise
+            except Exception as e:
+                last_error=e
+                if attempt<3:
+                    delay=retry_delays[attempt-1]; event(key,"recovery_retry_scheduled",stage=f"第{attempt}次恢复未确认，{int(delay)}秒后重试",attempt=attempt,next_attempt=attempt+1,delay_seconds=int(delay),reason=f"{type(e).__name__}: {str(e)[:220]}"); await asyncio.sleep(delay)
+        streak=recovery_failure_streak.get(key,0)+1; recovery_failure_streak[key]=streak; cooldown=min(300.0,300.0*(2**min(streak-1,2))); recovery_cooldown_until[key]=time.monotonic()+cooldown
+        event(key,"recovery_failed",stage=f"连续3次恢复未成功，{int(cooldown)}秒后再试",reason=f"{type(last_error).__name__}: {str(last_error)[:220]}",failure_streak=streak,cooldown_seconds=int(cooldown),attempts=3); return False
+    finally: active_run_keys.discard(key)
 
 async def _run_once_slot(key,cfg):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.

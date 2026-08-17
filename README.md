@@ -31,19 +31,18 @@ SDK 失败后使用官方客户端 + CDP 点击兜底
 - 协议/API 实时探针，默认约每 10 秒检查一次；
 - 正常账号跳过客户端，降低 CPU、内存和进程数量；
 - SDK 优先保活，官方客户端/CDP 作为兜底；
-- 8 个独立客户端槽位，彼此独立（按需创建，使用完销毁）：
+- 固定 6 个独立客户端槽位，彼此独立：
   - `slot0`：DISPLAY `:100`，CDP `9223`，VNC `5901`；
   - `slot1`：DISPLAY `:101`，CDP `9224`，VNC `5902`；
   - `slot2`：DISPLAY `:102`，CDP `9225`，VNC `5903`；
   - `slot3`：DISPLAY `:103`，CDP `9226`，VNC `5904`；
   - `slot4`：DISPLAY `:104`，CDP `9227`，VNC `5905`；
   - `slot5`：DISPLAY `:105`，CDP `9228`，VNC `5906`；
-  - `slot6`：DISPLAY `:106`，CDP `9229`，VNC `5907`；
-  - `slot7`：DISPLAY `:107`，CDP `9230`，VNC `5908`；
+
 - 账号列表、状态、当前阶段和阶段日志 WebUI；
 - 批量导入、批量导出、启动、停止、删除；
 - WebUI Basic Auth 和在线修改密码；
-- noVNC 观察实际正在运行的客户端槽位；槽位的 Xvfb/x11vnc 仅在兜底任务期间按需创建，并在任务结束后销毁；
+- noVNC 观察实际正在运行的客户端槽位；固定六槽位的 Xvfb/x11vnc 常驻，避免反复创建客户端显示环境；
 - Docker 开机自启动和容器 `unless-stopped`；
 - 事件日志尾部读取，避免日志不断增长导致内存占用增加；
 - 实时阶段日志和协议探针汇总；事件日志按大小自动轮转，避免长期运行占满磁盘。
@@ -53,16 +52,23 @@ SDK 失败后使用官方客户端 + CDP 点击兜底
 ### GitHub 安装
 
 ```bash
+tmp="$(mktemp)"
 curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
-  'https://raw.githubusercontent.com/952371672/linux-/main/install.sh' | sudo bash
+  'https://raw.githubusercontent.com/952371672/linux-/main/install.sh' -o "$tmp"
+sudo bash "$tmp"
+rm -f "$tmp"
 ```
 
 ### CNB 安装
 
 ```bash
-curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
-  'https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/install.sh' | sudo bash
+tmp="$(mktemp)"
+git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
+bash "$tmp/repo/install.sh"
+rm -rf "$tmp"
 ```
+
+不要使用 `curl ... | sudo bash`。如果安装脚本提前退出，管道读取端关闭会让 curl 报 `curl: (23) Failure writing output to destination`，这个错误会掩盖真正的安装错误。先下载到临时文件（或克隆 CNB 仓库），再执行脚本，才能看到真实错误信息。
 
 安装脚本会自动完成：
 
@@ -82,15 +88,20 @@ curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
 ### GitHub 更新
 
 ```bash
+tmp="$(mktemp)"
 curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
-  'https://raw.githubusercontent.com/952371672/linux-/main/update.sh' | sudo bash
+  'https://raw.githubusercontent.com/952371672/linux-/main/update.sh' -o "$tmp"
+sudo bash "$tmp"
+rm -f "$tmp"
 ```
 
 ### CNB 更新
 
 ```bash
-curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 \
-  'https://cnb.cool/952371672/cmcc-linux-docker/-/raw/main/update.sh' | sudo bash
+tmp="$(mktemp)"
+git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
+bash "$tmp/repo/update.sh"
+rm -rf "$tmp"
 ```
 
 更新脚本具有版本标记判断：如果当前服务器已经是同一个 `stable-latest` 资产，不会重复下载、停止容器或重建镜像。

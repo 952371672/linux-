@@ -8,7 +8,7 @@ DOCKER_INSTALL_URL="${DOCKER_INSTALL_URL:-https://get.docker.com}"
 DOCKER_MIRRORS="${DOCKER_MIRRORS:-https://docker.m.daocloud.io,https://dockerproxy.net,https://docker.1ms.run}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 step() { printf '\n==== [%s] %s ====\n' "$1" "$2"; }
-progress_download() { local url="$1" out="$2"; shift 2; rm -f "$out"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --max-time 1800 --progress-bar --show-error "$@" "$url" -o "$out"; printf '\n下载完成：%s\n' "$out"; }
+progress_download() { local url="$1" out="$2"; shift 2; local part="${out}.part"; rm -f "$out" "$part"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --max-time 1800 --progress-bar --show-error "$@" "$url" -o "$part"; [[ -s "$part" ]] || { echo '下载结果为空' >&2; return 1; }; mv -f "$part" "$out"; printf '\n下载完成：%s\n' "$out"; }
 step 1 '检查运行权限与系统依赖'
 [[ "$(id -u)" == 0 ]] || { echo '请使用 root 或 sudo 运行'; exit 1; }
 SUDO=''

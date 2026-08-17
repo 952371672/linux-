@@ -43,7 +43,7 @@ PY
   exit 0
  fi
  URL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["url"])' "$META")"
- [[ -n "$URL" ]] || exit 1; echo "下载：$URL"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -o "$ARCHIVE" "$URL"
+ [[ -n "$URL" ]] || exit 1; echo "下载：$URL"; PART="${ARCHIVE}.part"; rm -f "$ARCHIVE" "$PART"; curl --http1.1 -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --speed-time 60 --speed-limit 1024 --progress-bar --show-error -o "$PART" "$URL"; [[ -s "$PART" ]] || { echo '下载结果为空' >&2; exit 1; }; mv -f "$PART" "$ARCHIVE"
 fi
 [[ -s "$ARCHIVE" ]] || { echo '安装包为空'; exit 1; }
 echo '[3/7] 校验并解压'; unzip -tq "$ARCHIVE"; mkdir -p "$TMP/unpack"; unzip -q "$ARCHIVE" -d "$TMP/unpack"; DF="$(find "$TMP/unpack" -type f -name novnc-Dockerfile -print -quit)"; [[ -n "$DF" ]] || exit 1; SRC="$(dirname "$DF")"; [[ -f "$SRC/novnc-compose.yml" ]] || exit 1

@@ -1,5 +1,8 @@
-
-CMCC.Docker.zip
-*.deb
+.env
+data/
+profiles/
 __pycache__/
-
+*.pyc
+CMCC.Docker*.zip
+CMCC-JTYDN-UOSx86-2.23.1.deb
+*token*

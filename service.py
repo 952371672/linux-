@@ -27,7 +27,7 @@ if os.environ.get("CMCC_SECRET"):
 else:
     if not SECRET.exists(): SECRET.write_bytes(Fernet.generate_key()); SECRET.chmod(0o600)
     _fernet=Fernet(SECRET.read_bytes())
-APP_VERSION="1.5.6-efficient-observe"
+APP_VERSION="1.5.9-sdk-two-probe-priority-click"
 app=FastAPI(title=f"CMCC Linux v127 Keepalive {APP_VERSION}",version=APP_VERSION)
 WEBUI_USER=os.environ.get("CMCC_WEBUI_USER","").strip()
 WEBUI_PASSWORD=os.environ.get("CMCC_WEBUI_PASSWORD","")
@@ -91,22 +91,30 @@ recovery_priority:dict[str,int]={}
 recovery_admission:dict[str,str]={}
 recovery_admission_until:dict[str,float]={}
 recovery_confirmation_reported:set[str]=set()
-RECOVERY_SUCCESS_DEDUPE_COOLDOWN=90.0
-RECOVERY_FAILURE_COOLDOWN=60.0
+# SDK action completion is followed only by the normal 10-second worker probes.
+# After two consecutive ineffective 23 observations, a priority in-session
+# click job is admitted once through the same fixed six-slot scheduler.
+sdk_verify_remaining:dict[str,int]={}
+SDK_POST_ACTION_PROBES=2
+RECOVERY_SUCCESS_DEDUPE_COOLDOWN=0.0
+RECOVERY_FAILURE_COOLDOWN=0.0
+SDK_CLICK_OBSERVE_SECONDS=18.0
+SDK_CLICK_OBSERVE_INTERVAL=3.0
+CLICK_TRANSITION_TIMEOUT=12.0
+CLICK_TRANSITION_LIMIT=asyncio.Semaphore(2)
 SUSPECT_FAST_CONFIRM_DELAY=1.0
 STARTING_OBSERVE_WINDOW=30.0
 STARTING_RETRY_COOLDOWN=30.0
-# Per-account cadence: after recovery, wait 10s for the first check; once the
-# account is stable for one minute, use 30s until the long-online risk window.
-# No global probe semaphore: each account worker is single-flight and sleeps
-# independently, so accounts are not forced into one shared probe batch.
+# Central scheduler policy: every idle account uses the configured 10-second
+# lightweight probe. Once an account is QUEUED/RUNNING/COOLDOWN, its worker
+# waits; no per-account SDK-observation probes or click second-pass are issued.
 PROBE_RECOVERY_FIRST=10.0
-PROBE_CONSECUTIVE=2
-PROBE_STABLE_INTERVAL=30.0
+PROBE_CONSECUTIVE=1
+PROBE_STABLE_INTERVAL=10.0
 PROBE_LONG_ONLINE_INTERVAL=10.0
-PROBE_STABLE_AFTER=60.0
-PROBE_LONG_ONLINE_AFTER=15*60.0
-PROBE_JITTER_RATIO=0.10
+PROBE_STABLE_AFTER=0.0
+PROBE_LONG_ONLINE_AFTER=0.0
+PROBE_JITTER_RATIO=0.0
 RUNTIME_CONFIG=ROOT/"runtime-config.json"
 CONFIG_LOCK=threading.Lock()
 def _load_runtime_config():
@@ -1108,9 +1116,9 @@ async def sdk_keepalive(key,c,ws,cfg):
         await asyncio.sleep(1);r=c.eval("window.__cmcc_sdk||null");event(key,"sdk_poll",stage=f"SDK执行中 {n}s",detail=str({k:r.get(k) for k in ('done','error','phase','userServiceId','optionKeys','spuCode','vmId') if isinstance(r,dict) and k in r})[:500] if isinstance(r,dict) else str(r)[:300])
         if isinstance(r,dict) and r.get("done"):
             if r.get("error"):raise RuntimeError("SDK失败: "+str(r["error"])[:220])
-            event(key,"sdk_action_done",stage="SDK connectWorker 动作已完成，释放槽位并由独立探针观察云端状态",method="sdk_connectWorker",evidence="SDK返回done=true；这只是动作证据，不是云端恢复证明",reason="sdk_connectWorker_action_done",keepalive_confirmed=False,spuCode=r.get('spuCode'),vmId=r.get('vmId'));return True
+            event(key,"sdk_action_done",stage="SDK connectWorker 动作已完成，释放槽位并由独立探针观察云端状态",method="sdk_connectWorker",evidence="SDK返回done=true；这只是动作证据，不是云端恢复证明",reason="sdk_connectWorker_action_done",keepalive_confirmed=False,spuCode=r.get('spuCode'),vmId=r.get('vmId'));return "sdk_action_done"
     raise TimeoutError("SDK connectWorker 超时")
-async def click_fallback(key,c,ws,cfg):
+async def click_fallback(key,c,ws,cfg,transition_only=False):
     event(key,"click_fallback",stage="SDK失败，进入普通点击保活兜底",method="client_click_fallback",trigger="sdk_failed",next="connect_button_then_state_confirmation")
     # The page may have replaced its renderer after SDK failure. Rediscover and
     # reattach before searching for the button.
@@ -1151,7 +1159,7 @@ async def click_fallback(key,c,ws,cfg):
     before_body=str(c.eval("document.body.innerText") or "")
     before_state=cloud_state(c); before_card=str(before_state.get("text",''))
     changed=False; transition=False; transition_seen=False; last=before_body; consecutive_normal=0
-    end=time.time()+min(int(cfg.get("connect_timeout",120)),24)
+    end=time.time()+(CLICK_TRANSITION_TIMEOUT if transition_only else min(int(cfg.get("connect_timeout",120)),24))
     while time.time()<end:
         await asyncio.sleep(.7)
         try:
@@ -1181,6 +1189,9 @@ async def click_fallback(key,c,ws,cfg):
         transition_seen=transition_seen or transition or state_after_click
         changed=changed or card_changed or transition
         event(key,"poll",stage="点击保活等待状态恢复",changed=changed,transition=transition,transition_seen=transition_seen,normal=normal,normal_count=consecutive_normal,card=after_card[:320],body=last[:320])
+        if transition_only and transition:
+            event(key,"click_transition_seen",stage="页面已进入连接/启动转换态，释放客户端槽位，后续由轻量接口探针观察25/1",method="client_click_fallback",evidence="clicked card entered transition state",keepalive_confirmed=False,card=after_card[:320])
+            return "click_transition_seen"
         # Strong proof if we saw a transition. If the cloud page has already
         # jumped to final normal state, two consecutive normal reads are enough;
         # otherwise users wait even though the cloud is already running.
@@ -1191,41 +1202,41 @@ async def click_fallback(key,c,ws,cfg):
     try: await screenshot_quiet(key,c)
     except Exception: pass
     raise RuntimeError("点击后状态未恢复：未观察到稳定运行中状态；最后卡片状态="+before_card[:220]+"；最后页面="+last[:320])
-async def run_once(key,cfg):
-    # Account admission is single-flight across every trigger source. QUEUED
-    # covers time spent waiting for a slot, RUNNING covers the heavy lifecycle,
-    # and COOLDOWN coalesces repeated 23 observations after one action.
+async def run_once(key,cfg,mode="sdk"):
+    """Central recovery job. SDK errors click in-session; priority click is a later job."""
     now=time.monotonic(); state=recovery_admission.get(key,"IDLE"); until=recovery_admission_until.get(key,0.0)
     if state in ("QUEUED","RUNNING"):
-        event(key,"run_coalesced",stage="账号已有排队或运行中的保活任务，合并重复触发",reason="account_admission_single_flight",admission_state=state)
+        event(key,"run_coalesced",stage="账号已在中央恢复队列或保活中，暂停该账号探针并合并触发",reason="central_recovery_single_flight",admission_state=state)
         return False
     if state=="COOLDOWN" and until>now:
-        event(key,"run_coalesced",stage="账号处于恢复冷却，合并重复触发",reason="account_recovery_dedupe_cooldown",admission_state=state,cooldown_remaining=max(1,int(until-now)))
+        event(key,"run_coalesced",stage="账号恢复冷却中，暂停该账号探针",reason="central_recovery_cooldown",admission_state=state,cooldown_remaining=max(1,int(until-now)))
         return False
     recovery_admission[key]="QUEUED"; recovery_admission_until.pop(key,None)
-    recovery_confirmation_reported.discard(key)
     active_run_keys.add(key)
     priority_token=current_recovery_key.set(key)
     try:
-        result=await _run_once_slot(key,cfg)
-        # The API-state shortcut returns None after it has emitted a verified
-        # success event; only an explicit False is an unconfirmed recovery.
+        result=await _run_once_slot(key,cfg,mode=mode)
+        if mode=="sdk" and result=="sdk_action_done":
+            # No extra SDK polling. Resume ordinary 10s probes and let exactly
+            # two subsequent 23 results decide whether to enqueue priority click.
+            sdk_verify_remaining[key]=SDK_POST_ACTION_PROBES
+            event(key,"sdk_action_released",stage="SDK动作完成并释放槽位；等待后续两次常规10秒探针判定是否需要优先点击",method="sdk_connectWorker",verify_probes=SDK_POST_ACTION_PROBES,evidence="regular_probe_only",keepalive_confirmed=False)
+            result=True
         if result is False:
             raise RuntimeError("SDK/客户端恢复未确认成功")
         recovery_failure_streak.pop(key,None); recovery_cooldown_until.pop(key,None)
-        recovery_admission[key]="COOLDOWN"; recovery_admission_until[key]=time.monotonic()+RECOVERY_SUCCESS_DEDUPE_COOLDOWN
-        event(key,"recovery_admission",stage="本轮恢复完成，短暂合并重复23触发",admission_state="COOLDOWN",cooldown_seconds=int(RECOVERY_SUCCESS_DEDUPE_COOLDOWN))
+        recovery_admission[key]="IDLE"; recovery_admission_until.pop(key,None)
+        event(key,"recovery_admission",stage="中央恢复任务结束；立即恢复该账号常规10秒探针",admission_state="IDLE",cooldown_seconds=0,mode=mode)
         return True
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        sdk_verify_remaining.pop(key,None)
         streak=recovery_failure_streak.get(key,0)+1; recovery_failure_streak[key]=streak
-        # A failing account must not monopolise a slot, but exponential backoff
-        # can starve it for minutes.  Release it and allow one bounded retry after 60s.
-        cooldown=RECOVERY_FAILURE_COOLDOWN
-        recovery_cooldown_until[key]=time.monotonic()+cooldown
-        recovery_admission[key]="COOLDOWN"; recovery_admission_until[key]=time.monotonic()+cooldown
-        event(key,"recovery_failed",stage=f"恢复未成功，{int(cooldown)}秒后允许下一次重试",reason=f"{type(e).__name__}: {str(e)[:220]}",failure_streak=streak,cooldown_seconds=int(cooldown),admission_state="COOLDOWN")
+        cooldown=0.0
+        recovery_cooldown_until.pop(key,None)
+        recovery_admission[key]="IDLE"; recovery_admission_until.pop(key,None)
+        event(key,"recovery_failed",stage=f"{('优先点击' if mode=='click_transition' else '中央恢复')}未成功，已移除账号冷却并允许下一轮继续恢复",reason=f"{type(e).__name__}: {str(e)[:220]}",failure_streak=streak,cooldown_seconds=0,admission_state="IDLE",mode=mode)
         return False
     finally:
         active_run_keys.discard(key)
@@ -1234,7 +1245,7 @@ async def run_once(key,cfg):
         try: current_recovery_key.reset(priority_token)
         except Exception: pass
 
-async def _run_once_slot(key,cfg):
+async def _run_once_slot(key,cfg,mode="sdk"):
     # Every heavy run owns one isolated display/CDP slot for its whole lifetime.
     queued_at=time.monotonic(); priority=int(recovery_priority.get(key,0))
     event(key,"fallback_slot_wait",stage="等待兜底保活槽位（已确认23优先）",active=list(fallback_active),active_count=len(fallback_active),limit=fallback_slots.limit,queued_waiters=len(fallback_slots.waiters),allocation="priority_23_first",priority=priority)
@@ -1260,7 +1271,7 @@ async def _run_once_slot(key,cfg):
                     return True
             except Exception as pe:
                 event(key,"recovery_preflight_error",stage="取得槽位后复核失败，继续SDK/客户端恢复",reason=f"{type(pe).__name__}: {str(pe)[:180]}")
-            return await _run_once_heavy(key,cfg,slot)
+            return await _run_once_heavy(key,cfg,slot,mode=mode)
         finally:
             stop_active_client(key)
             reap_children()
@@ -1273,7 +1284,7 @@ async def _run_once_slot(key,cfg):
             reap_children()
             destroy_slot_runtime(slot); slot_pool.put_nowait(slot); current_slot.reset(token)
 
-async def _run_once_heavy(key,cfg,slot):
+async def _run_once_heavy(key,cfg,slot,mode="sdk"):
     profile=PROFILES/key;profile.mkdir(parents=True,exist_ok=True);p=log=ws=None
     try:
         event(key,"client_start",stage="启动Linux客户端（为本地SDK提供业务页）",slot=slot["name"],display=slot["display"],cdp_port=slot["port"])
@@ -1324,6 +1335,9 @@ async def _run_once_heavy(key,cfg,slot):
             t=ready[1]
             ws=websocket.create_connection(t["webSocketDebuggerUrl"],timeout=15); c=CDP(ws)
             c,ws,info=await login_and_find(c,ws,key,cfg,allow_client_restart=False)
+        if mode=="click_transition":
+            event(key,"click_transition_start",stage="在原六槽位池内点击并等待页面进入连接/启动转换态",click_transition_timeout_seconds=CLICK_TRANSITION_TIMEOUT,click_transition_limit=2,slot=slot["name"])
+            return await click_fallback(key,c,ws,cfg,transition_only=True)
         if "#/home" in str(info.get("url",'')) and "暂无任何匹配结果" not in str(info.get("body",'')) and any(x in str(info.get("body",'')) for x in ("连接","运行中","正常","已关机","家庭云电脑","个人云电脑")):
             # Short-circuit an already-running cloud before SDK/click. The renderer
             # may expose vmStatus=1 even when the card text is delayed.
@@ -1332,15 +1346,14 @@ async def _run_once_heavy(key,cfg,slot):
                 reason="initial_running_vmStatus_1" if rt.get("vm1") else "initial_cloud_state_normal"
                 event(key,"success",stage="保活成功：进入业务页时云电脑已经运行中",method="initial_state",evidence="当前renderer云卡状态",reason=reason,vmStatus=1 if rt.get("vm1") else None,card=str(st.get("text",''))[:260],keepalive_confirmed=True)
                 return
-            try: await sdk_keepalive(key,c,ws,cfg)
+            try: return await sdk_keepalive(key,c,ws,cfg)
             except Exception as e:
                 event(key,"sdk_failed",stage="本地SDK失败，准备点击兜底",reason=f"{type(e).__name__}: {str(e)[:220]}")
-                await click_fallback(key,c,ws,cfg)
-            return
-        try: await sdk_keepalive(key,c,ws,cfg)
+                return await click_fallback(key,c,ws,cfg)
+        try: return await sdk_keepalive(key,c,ws,cfg)
         except Exception as e:
             event(key,"sdk_failed",stage="本地SDK失败，准备点击兜底",reason=f"{type(e).__name__}: {str(e)[:220]}")
-            await click_fallback(key,c,ws,cfg)
+            return await click_fallback(key,c,ws,cfg)
     finally:
         if ws:
             try:ws.close()
@@ -1381,10 +1394,11 @@ async def worker(key):
             try:
                 reap_children()
                 result=await asyncio.to_thread(probe_account,key,cfg)
-                # Confirm a first shutdown observation after one second. This
-                # adds work only for abnormal accounts and shortens detection.
-                if result.get("class") in ("suspect","need"):
-                    event(key,"probe_fast_confirm",stage="首次异常，1秒后快速复核关机状态",delay_seconds=SUSPECT_FAST_CONFIRM_DELAY,vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
+                # A confirmed vmStatus=23 is already an authoritative powered-off
+                # state. Avoid a second protocol request: the central queue owns
+                # recovery, so this worker is paused once it is admitted.
+                if result.get("vmStatus") not in (23,"23") and result.get("class") in ("suspect","need"):
+                    event(key,"probe_fast_confirm",stage="非23异常，1秒后快速复核",delay_seconds=SUSPECT_FAST_CONFIRM_DELAY,vmStatus=result.get("vmStatus"),detail=result.get("reason",""))
                     await asyncio.sleep(SUSPECT_FAST_CONFIRM_DELAY)
                     confirm=await asyncio.to_thread(probe_account,key,cfg)
                     if confirm.get("class") not in ("suspect","need"):
@@ -1417,6 +1431,10 @@ async def worker(key):
                     if admission_state=="COOLDOWN" and admission_until<=time.monotonic():
                         recovery_admission.pop(key,None); recovery_admission_until.pop(key,None)
                     vm=result.get("vmStatus")
+                    if vm in (1,"1",25,"25"):
+                        # Any observed start/running state makes the SDK action
+                        # effective; cancel the two-probe click qualification.
+                        sdk_verify_remaining.pop(key,None)
                     if vm in (1,"1",25,"25") and admission_state=="COOLDOWN" and admission_until>time.monotonic() and key not in recovery_confirmation_reported:
                         recovery_confirmation_reported.add(key)
                         event(key,"recovery_confirmed",stage="独立接口探针确认SDK动作后云电脑已进入启动或运行状态",method="api_probe",evidence="fresh vmStatus=25/1",vmStatus=int(vm),keepalive_confirmed=True)
@@ -1428,14 +1446,33 @@ async def worker(key):
                         event(key,"probe_normal",stage="接口探针确认云电脑正常，跳过客户端保活",method="api_probe",evidence="当前SOHO云电脑列表状态",vmStatus=vm,detail=result.get("reason",""))
                 elif cls in ("suspect","need"):
                     if count>=PROBE_CONSECUTIVE:
-                        fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_twice"
-                        event(key,"probe_trigger",stage="接口探针连续确认异常，触发SDK/点击保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
-                        recovery_priority[key]=20 if result.get("vmStatus") in (23,"23") else 10
-                        ok=await run_once(key,cfg)
-                        recovery_priority.pop(key,None)
-                        obs=probe_observation.setdefault(key,{})
-                        obs["recovery_count"]=int(obs.get("recovery_count",0))+1; obs["last_recovery_at"]=time.time(); _save_probe_observation()
-                        probe_last[key]=(None,0)
+                        # A successful SDK is not re-run immediately. Count only
+                        # normal 10s probes that remain at confirmed 23; the second
+                        # ineffective result enters a higher-priority click job.
+                        remaining=sdk_verify_remaining.get(key)
+                        if remaining is not None and result.get("vmStatus") in (23,"23"):
+                            remaining-=1; sdk_verify_remaining[key]=remaining
+                            event(key,"sdk_post_probe_ineffective",stage=f"SDK动作后常规探针仍为23，剩余确认 {remaining}/{SDK_POST_ACTION_PROBES}",vmStatus=23,remaining_probes=remaining,total_probes=SDK_POST_ACTION_PROBES)
+                            if remaining<=0:
+                                sdk_verify_remaining.pop(key,None)
+                                recovery_priority[key]=30
+                                event(key,"priority_click_queued",stage="SDK后两次常规探针均无效，优先进入中央槽位点击兜底",priority=30,trigger="sdk_action_then_two_23_probes",vmStatus=23)
+                                try:
+                                    await run_once(key,cfg,mode="click_transition")
+                                finally:
+                                    recovery_priority.pop(key,None)
+                            probe_last[key]=(None,0)
+                        else:
+                            fast="strong_shutdown" if result.get("strong_shutdown") else "confirmed_23"
+                            event(key,"probe_trigger",stage="接口探针确认异常，触发中央SDK保活",trigger_class=cls,probe_count=count,trigger_policy=fast,detail=result.get("reason",""))
+                            recovery_priority[key]=20 if result.get("vmStatus") in (23,"23") else 10
+                            try:
+                                await run_once(key,cfg,mode="sdk")
+                            finally:
+                                recovery_priority.pop(key,None)
+                            obs=probe_observation.setdefault(key,{})
+                            obs["recovery_count"]=int(obs.get("recovery_count",0))+1; obs["last_recovery_at"]=time.time(); _save_probe_observation()
+                            probe_last[key]=(None,0)
 
                 elif cls=="unknown" and count>=PROBE_CONSECUTIVE and result.get("reason")!="缺少SohoToken":
                     event(key,"probe_unknown",stage="接口探针连续未知，触发一次客户端兜底",probe_count=count,detail=result.get("reason",""))

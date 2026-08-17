@@ -9,6 +9,7 @@ services:
       CMCC_WEBUI_USER: ${CMCC_WEBUI_USER:-admin}
       CMCC_WEBUI_PASSWORD: ${CMCC_WEBUI_PASSWORD:-admin}
       CMCC_WEBUI_REALM: CMCC Keepalive
+      CMCC_PROTOCOL_ACCOUNT_KEY: ${CMCC_PROTOCOL_ACCOUNT_KEY:-}
       TZ: Asia/Shanghai
     ports:
       - "8080:8080"

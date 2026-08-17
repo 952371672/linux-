@@ -62,7 +62,7 @@ rm -f "$tmp"
 ### CNB 安装
 
 ```bash
-tmp="$(mktemp)"
+tmp="$(mktemp -d)"
 git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
 bash "$tmp/repo/install.sh"
 rm -rf "$tmp"
@@ -98,7 +98,7 @@ rm -f "$tmp"
 ### CNB 更新
 
 ```bash
-tmp="$(mktemp)"
+tmp="$(mktemp -d)"
 git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
 bash "$tmp/repo/update.sh"
 rm -rf "$tmp"

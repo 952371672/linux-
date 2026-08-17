@@ -64,7 +64,7 @@ rm -f "$tmp"
 ```bash
 tmp="$(mktemp -d)"
 git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
-bash "$tmp/repo/install.sh"
+bash "$tmp/repo/install-cnb.sh"
 rm -rf "$tmp"
 ```
 
@@ -100,7 +100,7 @@ rm -f "$tmp"
 ```bash
 tmp="$(mktemp -d)"
 git clone --depth 1 'https://cnb.cool/952371672/cmcc-linux-docker.git' "$tmp/repo"
-bash "$tmp/repo/update.sh"
+bash "$tmp/repo/update-cnb.sh"
 rm -rf "$tmp"
 ```
 
